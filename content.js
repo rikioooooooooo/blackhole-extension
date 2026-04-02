@@ -303,7 +303,10 @@ function finishOff() {
 
   // 残りのフラグ除去
   const hidden = document.querySelectorAll('[data-bh="1"]');
-  for (const el of hidden) { el.removeAttribute('data-bh'); el.style.visibility = ''; el.style.pointerEvents = ''; }
+  for (const el of hidden) {
+    el.removeAttribute('data-bh'); el.style.visibility = ''; el.style.pointerEvents = '';
+    if (el.tagName === 'VIDEO' && el.paused) try { el.play(); } catch {}
+  }
   const markers = document.querySelectorAll('[data-bh-marker]');
   for (const el of markers) { el.removeAttribute('data-bh-marker'); el.style.listStyle = ''; }
   const befores = document.querySelectorAll('[data-bh-before]');
@@ -499,9 +502,26 @@ function peel() {
       continue;
     }
 
+    // VIDEO: 現在フレームをキャプチャしてタイル分解
+    if (el.tagName === 'VIDEO') {
+      const bs = tileVideo(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
+      continue;
+    }
+
+    // CANVAS: そのままタイル分解
+    if (el.tagName === 'CANVAS') {
+      const bs = tileCanvas(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
+      continue;
+    }
+
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) continue;
-    if (r.width * r.height > 40000 && el.children.length > 3) continue;
+    // 大きい要素でも子が少なければ吸収OK（動画オーバーレイ等）
+    if (r.width * r.height > 40000 && el.children.length > 5) continue;
 
     // リストマーカー・疑似要素もパーティクル化
     peelPseudo(el);
@@ -717,6 +737,120 @@ function tileImg(img) {
 
   img.style.visibility = 'hidden';
   img.style.pointerEvents = 'none';
+  return out;
+}
+
+/* ---- 動画タイル分解 ---- */
+function tileVideo(video) {
+  const r = video.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return [];
+  if (video.getAttribute('data-bh') === '1') return [];
+  video.setAttribute('data-bh', '1');
+
+  // 現在のフレームをcanvasにキャプチャ
+  let dataUrl;
+  try {
+    const cvs = document.createElement('canvas');
+    cvs.width = Math.min(r.width, 640);
+    cvs.height = Math.min(r.height, 360);
+    const ctx = cvs.getContext('2d');
+    ctx.drawImage(video, 0, 0, cvs.width, cvs.height);
+    dataUrl = cvs.toDataURL('image/jpeg', 0.7);
+  } catch {
+    // CORS制限でキャプチャ不可 → 黒タイルで代替
+    dataUrl = null;
+  }
+
+  let tw = TILE_PX, th = TILE_PX;
+  let cols = Math.ceil(r.width / tw), rows = Math.ceil(r.height / th);
+  while (cols * rows > MAX_TILES && tw < 80) { tw += 4; th += 4; cols = Math.ceil(r.width / tw); rows = Math.ceil(r.height / th); }
+
+  const out = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const w = Math.min(tw, r.width - col * tw);
+      const h = Math.min(th, r.height - row * th);
+      const x = r.left + col * tw, y = r.top + row * th;
+
+      const d = document.createElement('div');
+      d.className = 'bh-particle';
+      d.style.cssText =
+        `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+      if (dataUrl) {
+        d.style.backgroundImage = `url("${dataUrl}")`;
+        d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
+        d.style.backgroundSize = `${r.width}px ${r.height}px`;
+      } else {
+        d.style.background = '#111';
+      }
+      document.body.appendChild(d);
+
+      const cx = x + w / 2, cy = y + h / 2;
+      const dx = mx - cx, dy = my - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+
+      out.push({
+        el: d, x: cx, y: cy, ox: cx, oy: cy,
+        vx: (dx / dist) * INIT_SPEED * 0.5, vy: (dy / dist) * INIT_SPEED * 0.5, rot: 0
+      });
+    }
+  }
+
+  video.style.visibility = 'hidden';
+  video.style.pointerEvents = 'none';
+  video.pause();
+  return out;
+}
+
+/* ---- Canvasタイル分解 ---- */
+function tileCanvas(canvas) {
+  const r = canvas.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return [];
+  if (canvas.getAttribute('data-bh') === '1') return [];
+  canvas.setAttribute('data-bh', '1');
+
+  let dataUrl;
+  try { dataUrl = canvas.toDataURL('image/jpeg', 0.7); } catch { dataUrl = null; }
+
+  let tw = TILE_PX, th = TILE_PX;
+  let cols = Math.ceil(r.width / tw), rows = Math.ceil(r.height / th);
+  while (cols * rows > MAX_TILES && tw < 80) { tw += 4; th += 4; cols = Math.ceil(r.width / tw); rows = Math.ceil(r.height / th); }
+
+  const out = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const w = Math.min(tw, r.width - col * tw);
+      const h = Math.min(th, r.height - row * th);
+      const x = r.left + col * tw, y = r.top + row * th;
+
+      const d = document.createElement('div');
+      d.className = 'bh-particle';
+      d.style.cssText =
+        `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+      if (dataUrl) {
+        d.style.backgroundImage = `url("${dataUrl}")`;
+        d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
+        d.style.backgroundSize = `${r.width}px ${r.height}px`;
+      } else {
+        d.style.background = '#222';
+      }
+      document.body.appendChild(d);
+
+      const cx = x + w / 2, cy = y + h / 2;
+      const dx = mx - cx, dy = my - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+
+      out.push({
+        el: d, x: cx, y: cy, ox: cx, oy: cy,
+        vx: (dx / dist) * INIT_SPEED * 0.5, vy: (dy / dist) * INIT_SPEED * 0.5, rot: 0
+      });
+    }
+  }
+
+  canvas.style.visibility = 'hidden';
+  canvas.style.pointerEvents = 'none';
   return out;
 }
 
