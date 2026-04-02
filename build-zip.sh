@@ -12,6 +12,7 @@ zip -r "$ZIP_NAME" \
   content.js \
   styles.css \
   icons/ \
+  _locales/ \
   -x "*.git*" "test/*" "store-assets/*" "node_modules/*" "*.sh" "*.html" "*.mjs" "generate-icons.*" "PRIVACY.md" "README.md"
 
 echo "Created: $ZIP_NAME"

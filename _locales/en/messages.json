@@ -1,0 +1,11 @@
+{
+  "extName": {
+    "message": "Black Hole"
+  },
+  "extDescription": {
+    "message": "Suck web page content into a black hole. Click the icon, move your mouse, and watch everything get absorbed!"
+  },
+  "actionTitle": {
+    "message": "Black Hole ON/OFF"
+  }
+}

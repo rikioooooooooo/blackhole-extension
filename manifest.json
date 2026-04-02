@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Black Hole",
+  "name": "__MSG_extName__",
   "version": "1.0.0",
-  "description": "Suck web page content into a black hole. Click the icon, move your mouse, and watch everything get absorbed!",
+  "description": "__MSG_extDescription__",
+  "default_locale": "en",
   "permissions": ["activeTab", "scripting"],
   "host_permissions": ["<all_urls>"],
   "action": {
@@ -11,7 +12,7 @@
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     },
-    "default_title": "Black Hole ON/OFF"
+    "default_title": "__MSG_actionTitle__"
   },
   "background": {
     "service_worker": "background.js"
