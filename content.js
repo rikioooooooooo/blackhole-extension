@@ -13,7 +13,6 @@
 
 /* ==== 定数 ==== */
 const BH_INITIAL  = 12;
-const BH_MAX      = 500;
 const BH_FIELD    = 4;
 
 const GRAVITY     = 3000;
@@ -29,9 +28,6 @@ const MAX_TILES   = 200;
 
 const PHASE2      = 150;
 const PHASE_FIXED = 200;
-const PHASE_DARK  = 300;
-const PHASE_PULL  = 400;
-const PHASE_MAX   = 500;
 
 const SKIP = new Set([
   'HTML','BODY','HEAD','SCRIPT','STYLE','LINK','META','NOSCRIPT','TEMPLATE'
@@ -49,7 +45,7 @@ const COL3 = ['#F97316','#EF4444','#DC2626','#EA580C'];
 let on = false, toggling = false;
 let sz = BH_INITIAL;
 let mx = 0, my = 0;
-let ctr = null, ovl = null;
+let ctr = null;
 let raf = null, ambId = null, ambCnt = 0;
 let lastTs = 0, samplePhase = 0, prevMx = 0, prevMy = 0;
 let totalAbsorbed = 0;
@@ -77,11 +73,43 @@ chrome.runtime.onMessage.addListener((m) => {
   }
 });
 
-/* ==== SPA ==== */
-const spaObs = new MutationObserver(() => {
+/* ==== SPA + YouTube サムネ復活防止 ==== */
+const spaObs = new MutationObserver((mutations) => {
   if (on && ctr && !document.body.contains(ctr)) mkBH();
+
+  // 吸収済み要素の中に新しく追加されたIMG/VIDEO等も自動で隠す
+  if (!on) return;
+  for (const m of mutations) {
+    if (m.type !== 'childList') continue;
+    for (const node of m.addedNodes) {
+      if (node.nodeType !== 1) continue;
+      // 親が吸収済みなら新しい子も隠す
+      const parent = node.parentElement;
+      if (parent && parent.getAttribute('data-bh') === '1') {
+        node.style.visibility = 'hidden';
+        node.style.pointerEvents = 'none';
+        continue;
+      }
+      // YouTube: 新しく挿入されたIMGがマウス付近にあれば即吸収
+      if ((node.tagName === 'IMG' || node.tagName === 'VIDEO') && node.getAttribute('data-bh') !== '1') {
+        const nr = node.getBoundingClientRect();
+        if (nr.width > 2 && nr.height > 2) {
+          const dist = Math.hypot(mx - (nr.left + nr.width / 2), my - (nr.top + nr.height / 2));
+          if (dist < sz + 50) {
+            if (node.tagName === 'IMG') {
+              const bs = tileImg(node);
+              for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+            } else {
+              const bs = tileVideo(node);
+              for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+            }
+          }
+        }
+      }
+    }
+  }
 });
-spaObs.observe(document.body || document.documentElement, { childList: true });
+spaObs.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
 /* ==== ON ==== */
 function activate() {
@@ -95,6 +123,8 @@ function activate() {
   mkBH();
   document.addEventListener('mousemove', onM);
   document.addEventListener('contextmenu', onRC);
+  // YouTube等のhoverトリガーを無効化
+  for (const ev of HOVER_EVENTS) document.addEventListener(ev, blockHover, true);
   raf = requestAnimationFrame(loop);
   startAmb();
   requestAnimationFrame(() => { toggling = false; });
@@ -108,6 +138,7 @@ function off() {
   if (raf) { cancelAnimationFrame(raf); raf = null; }
   if (ambId) { clearInterval(ambId); ambId = null; }
   document.removeEventListener('contextmenu', onRC);
+  for (const ev of HOVER_EVENTS) document.removeEventListener(ev, blockHover, true);
 
   // 吸引中のパーティクル除去
   for (const b of bodies) b.el.remove();
@@ -120,10 +151,6 @@ function off() {
   }
   ambParts.length = 0;
   ambCnt = 0;
-
-  // オーバーレイ除去
-  document.documentElement.classList.remove('bh-screen-shake');
-  if (ovl) { ovl.style.opacity = '0'; const o = ovl; const t = setTimeout(() => { o.remove(); tids.delete(t); }, 600); tids.add(t); ovl = null; }
 
   // ---- 復元対象を収集 ----
   const restoreJobs = [];
@@ -348,6 +375,15 @@ function mkBH() {
 
 function onM(e) { mx = e.clientX; my = e.clientY; }
 
+/* マウスイベントをキャプチャフェーズで止め、YouTube等の自動再生トリガーを無効化 */
+function blockHover(e) {
+  const el = e.target;
+  if (!el || el === ctr || (ctr && ctr.contains(el))) return;
+  if (el.classList && el.classList.contains('bh-particle')) return;
+  e.stopPropagation();
+}
+const HOVER_EVENTS = ['mouseenter', 'mouseover', 'mouseleave', 'mouseout', 'pointerenter', 'pointerover', 'pointerleave', 'pointerout'];
+
 function updPos() {
   if (!ctr) return;
   ctr.style.setProperty('--bh-x', mx + 'px');
@@ -358,16 +394,6 @@ function updPos() {
 function updSz() {
   if (!ctr) return;
   ctr.style.setProperty('--bh-size', sz + 'px');
-  if (sz >= PHASE_DARK) { ensureOvl(); ovl.style.opacity = sz >= PHASE_PULL ? '0.5' : '0.3'; }
-  if (sz >= PHASE_MAX) document.documentElement.classList.add('bh-screen-shake');
-}
-
-function ensureOvl() {
-  if (ovl && document.body.contains(ovl)) return;
-  ovl = document.createElement('div');
-  ovl.id = 'bh-overlay';
-  document.body.appendChild(ovl);
-  requestAnimationFrame(() => { if (ovl) ovl.style.opacity = '0.3'; });
 }
 
 /* ================================================================
@@ -1191,22 +1217,21 @@ function absorb() {
 }
 
 function grow() {
-  if (sz >= BH_MAX) return;
   totalAbsorbed++;
 
   // 階段式成長チェック
   let stepped = false;
   for (const [threshold, jumpSz] of GROWTH_STEPS) {
     if (totalAbsorbed === threshold && sz < jumpSz) {
-      sz = Math.min(jumpSz, BH_MAX);
+      sz = jumpSz;
       stepped = true;
       break;
     }
   }
 
-  // 通常の漸進成長
+  // 通常の漸進成長（無限）
   if (!stepped) {
-    sz = Math.min(sz + GROW_RATE, BH_MAX);
+    sz += GROW_RATE;
   }
 
   updSz();
@@ -1229,7 +1254,7 @@ function spawnAmb() {
   const p = document.createElement('div');
   p.className = 'bh-particle';
   const s = 2 + Math.random() * 2;
-  const cols = sz >= PHASE_DARK ? COL3 : sz >= PHASE2 ? COL2 : COL1;
+  const cols = sz >= 300 ? COL3 : sz >= PHASE2 ? COL2 : COL1;
   const col = cols[Math.random() * cols.length | 0];
   const ang = Math.random() * Math.PI * 2;
   const dist = sz * 0.8 + Math.random() * 30;
