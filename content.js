@@ -217,8 +217,8 @@ function off() {
 
   let completed = 0;
   const total = restoreJobs.length;
-  const TOTAL_LAUNCH_MS = 1200;  // 全射出にかける時間
-  const STAGGER = Math.max(5, Math.min(20, TOTAL_LAUNCH_MS / total));
+  const TOTAL_LAUNCH_MS = Math.min(1200, total * 3);  // 大量の場合は短縮
+  const STAGGER = Math.max(1, Math.min(20, TOTAL_LAUNCH_MS / total));
   const startSz = sz;
 
   restoreJobs.forEach((job, i) => {
@@ -238,7 +238,7 @@ function off() {
         }
       }
 
-      launchRestore(job, bhX, bhY, () => {
+      launchRestore(job, bhX, bhY, total, () => {
         completed++;
         if (completed >= total) finishOff();
       });
@@ -250,7 +250,7 @@ function off() {
 }
 
 /* ---- 1つの復元パーティクルを射出 ---- */
-function launchRestore(job, bhX, bhY, onDone) {
+function launchRestore(job, bhX, bhY, total, onDone) {
   const p = document.createElement('span');
   p.className = 'bh-particle';
 
@@ -285,7 +285,7 @@ function launchRestore(job, bhX, bhY, onDone) {
   const midY = dy * 0.5 + perpY * curve;
   const rotDir = (Math.random() - 0.5) * 720;
 
-  const dur = 600 + Math.random() * 400;
+  const dur = total > 200 ? 300 + Math.random() * 200 : 600 + Math.random() * 400;
 
   const anim = p.animate([
     { transform: 'scale(0) rotate(0deg)', opacity: 0 },
