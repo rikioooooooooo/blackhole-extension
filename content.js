@@ -34,10 +34,11 @@ const PHASE_PULL  = 400;
 const PHASE_MAX   = 500;
 
 const SKIP = new Set([
-  'HTML','BODY','HEAD','SCRIPT','STYLE','LINK','META','NOSCRIPT','TEMPLATE','IFRAME'
+  'HTML','BODY','HEAD','SCRIPT','STYLE','LINK','META','NOSCRIPT','TEMPLATE'
 ]);
 const LEAF_TAGS = new Set([
-  'IMG','INPUT','TEXTAREA','SELECT','VIDEO','AUDIO','CANVAS','SVG','HR','BR'
+  'IMG','INPUT','TEXTAREA','SELECT','VIDEO','AUDIO','CANVAS','SVG','HR','BR',
+  'BUTTON','OBJECT','EMBED'
 ]);
 
 const COL1 = ['#8B5CF6','#3B82F6','#7C3AED'];
@@ -495,10 +496,13 @@ function peel() {
       continue;
     }
 
-    if (el.tagName === 'IMG') {
-      const bs = tileImg(el);
-      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-      n += bs.length;
+    if (el.tagName === 'IMG' || el.tagName === 'PICTURE') {
+      const img = el.tagName === 'PICTURE' ? el.querySelector('img') : el;
+      if (img) {
+        const bs = tileImg(img);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        n += bs.length;
+      }
       continue;
     }
 
@@ -510,7 +514,7 @@ function peel() {
       continue;
     }
 
-    // CANVAS: そのままタイル分解
+    // CANVAS (2D / WebGL): タイル分解
     if (el.tagName === 'CANVAS') {
       const bs = tileCanvas(el);
       for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
@@ -518,10 +522,50 @@ function peel() {
       continue;
     }
 
+    // SVG: canvas経由でラスタライズしてタイル分解
+    if (el.tagName === 'svg' || el.tagName === 'SVG' || el instanceof SVGElement) {
+      const bs = tileSVG(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
+      continue;
+    }
+
+    // IFRAME: 同一オリジンのみ吸収
+    if (el.tagName === 'IFRAME') {
+      const bs = tileIframe(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
+      continue;
+    }
+
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) continue;
+
+    // Shadow DOM: openなshadowRootの中身を再帰的にチェック
+    if (el.shadowRoot) {
+      peelShadow(el.shadowRoot);
+    }
+
+    // CSS背景画像: backgroundImageがある要素はタイル化
+    const bgImg = getComputedStyle(el).backgroundImage;
+    if (bgImg && bgImg !== 'none' && !hasVisibleText(el)) {
+      const bs = tileBgImage(el, r, bgImg);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
+      continue;
+    }
+
     // 大きい要素でも子が少なければ吸収OK（動画オーバーレイ等）
     if (r.width * r.height > 40000 && el.children.length > 5) continue;
+
+    // フォームコントロール
+    if (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') {
+      if (!hasVisibleText(el) || el.tagName === 'INPUT') {
+        absorbEl(el, r);
+        n++;
+        continue;
+      }
+    }
 
     // リストマーカー・疑似要素もパーティクル化
     peelPseudo(el);
@@ -811,7 +855,21 @@ function tileCanvas(canvas) {
   canvas.setAttribute('data-bh', '1');
 
   let dataUrl;
-  try { dataUrl = canvas.toDataURL('image/jpeg', 0.7); } catch { dataUrl = null; }
+  try {
+    // WebGL: preserveDrawingBuffer=falseの場合toDataURLが空になる対策
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    if (gl) {
+      // WebGLの場合、現在のフレームバッファを強制読み取り
+      const w = canvas.width, h = canvas.height;
+      const tmpCvs = document.createElement('canvas');
+      tmpCvs.width = w; tmpCvs.height = h;
+      const ctx2d = tmpCvs.getContext('2d');
+      ctx2d.drawImage(canvas, 0, 0);
+      dataUrl = tmpCvs.toDataURL('image/jpeg', 0.7);
+    } else {
+      dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+    }
+  } catch { dataUrl = null; }
 
   let tw = TILE_PX, th = TILE_PX;
   let cols = Math.ceil(r.width / tw), rows = Math.ceil(r.height / th);
@@ -851,6 +909,225 @@ function tileCanvas(canvas) {
 
   canvas.style.visibility = 'hidden';
   canvas.style.pointerEvents = 'none';
+  return out;
+}
+
+/* ---- SVGラスタライズ+タイル分解 ---- */
+function tileSVG(svg) {
+  const r = svg.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return [];
+  if (svg.getAttribute('data-bh') === '1') return [];
+  svg.setAttribute('data-bh', '1');
+
+  let dataUrl;
+  try {
+    const serializer = new XMLSerializer();
+    const svgStr = serializer.serializeToString(svg);
+    const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+    dataUrl = URL.createObjectURL(blob);
+  } catch { dataUrl = null; }
+
+  if (!dataUrl) {
+    svg.style.visibility = 'hidden';
+    svg.style.pointerEvents = 'none';
+    return _tileFallback(svg, r, '#333');
+  }
+
+  // SVGをcanvasにレンダリング（非同期だがベストエフォート）
+  const img = new Image();
+  img.src = dataUrl;
+  const out = _tileWithSrc(r, dataUrl);
+  svg.style.visibility = 'hidden';
+  svg.style.pointerEvents = 'none';
+  return out;
+}
+
+/* ---- iframeタイル分解（同一オリジンのみ） ---- */
+function tileIframe(iframe) {
+  const r = iframe.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return [];
+  if (iframe.getAttribute('data-bh') === '1') return [];
+
+  // 同一オリジンチェック
+  try {
+    const doc = iframe.contentDocument || iframe.contentWindow?.document;
+    if (!doc) return _tileFallback(iframe, r, '#1a1a2e');
+  } catch {
+    // クロスオリジン → フレーム全体をパーティクルとして吸収
+    iframe.setAttribute('data-bh', '1');
+    iframe.style.visibility = 'hidden';
+    iframe.style.pointerEvents = 'none';
+    return _tileFallback(iframe, r, '#1a1a2e');
+  }
+
+  iframe.setAttribute('data-bh', '1');
+  iframe.style.visibility = 'hidden';
+  iframe.style.pointerEvents = 'none';
+  return _tileFallback(iframe, r, '#1a1a2e');
+}
+
+/* ---- CSS背景画像のタイル分解 ---- */
+function tileBgImage(el, r, bgImg) {
+  if (el.getAttribute('data-bh') === '1') return [];
+  el.setAttribute('data-bh', '1');
+  el.style.visibility = 'hidden';
+  el.style.pointerEvents = 'none';
+
+  // url("...") を抽出
+  const urlMatch = bgImg.match(/url\(["']?([^"')]+)["']?\)/);
+  if (urlMatch) {
+    return _tileWithSrc(r, urlMatch[1]);
+  }
+
+  // gradient: CSSグラデーションはそのまま背景に設定
+  let tw = TILE_PX, th = TILE_PX;
+  let cols = Math.ceil(r.width / tw), rows = Math.ceil(r.height / th);
+  while (cols * rows > MAX_TILES && tw < 80) { tw += 4; th += 4; cols = Math.ceil(r.width / tw); rows = Math.ceil(r.height / th); }
+
+  const out = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const w = Math.min(tw, r.width - col * tw);
+      const h = Math.min(th, r.height - row * th);
+      const x = r.left + col * tw, y = r.top + row * th;
+
+      const d = document.createElement('div');
+      d.className = 'bh-particle';
+      d.style.cssText =
+        `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;` +
+        `background:${bgImg};background-size:${r.width}px ${r.height}px;` +
+        `background-position:-${col * tw}px -${row * th}px;`;
+      document.body.appendChild(d);
+
+      const cx = x + w / 2, cy = y + h / 2;
+      const dx = mx - cx, dy = my - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+      out.push({
+        el: d, x: cx, y: cy, ox: cx, oy: cy,
+        vx: (dx / dist) * INIT_SPEED * 0.5, vy: (dy / dist) * INIT_SPEED * 0.5, rot: 0
+      });
+    }
+  }
+  return out;
+}
+
+/* ---- Shadow DOM再帰走査 ---- */
+function peelShadow(root) {
+  if (!root) return;
+  // Shadow DOM内のテキストノードを走査
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (!node.textContent.trim()) continue;
+    const parent = node.parentElement;
+    if (!parent || parent.hasAttribute('data-bh-erased')) continue;
+    // Shadow DOM内のテキストを通常のeraseChar処理
+    const text = node.textContent;
+    for (let i = 0; i < text.length && bodies.length < MAX_BODIES; i++) {
+      const cpLen = cpLength(text, i);
+      const ch = text.slice(i, i + cpLen);
+      if (!ch.trim()) continue;
+      const rc = charRect(node, i, cpLen);
+      if (!rc || rc.width < 0.3 || rc.height < 0.3) continue;
+      const span = eraseChar(node, i, cpLen);
+      if (span) {
+        mkCharBody(span, rc, parent);
+        break; // TreeWalkerが無効になるので1文字ずつ
+      }
+    }
+  }
+
+  // Shadow DOM内の要素も吸収
+  const els = root.querySelectorAll('img, video, canvas, svg, button');
+  for (const el of els) {
+    if (el.getAttribute('data-bh') === '1') continue;
+    if (el.tagName === 'IMG') {
+      const bs = tileImg(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+    } else if (el.tagName === 'VIDEO') {
+      const bs = tileVideo(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+    } else if (el.tagName === 'CANVAS') {
+      const bs = tileCanvas(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+    } else if (el.tagName === 'svg' || el.tagName === 'SVG' || el instanceof SVGElement) {
+      const bs = tileSVG(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+    } else {
+      const r = el.getBoundingClientRect();
+      if (r.width > 2 && r.height > 2) absorbEl(el, r);
+    }
+  }
+}
+
+/* ---- 汎用タイルヘルパー ---- */
+function _tileWithSrc(r, src) {
+  let tw = TILE_PX, th = TILE_PX;
+  let cols = Math.ceil(r.width / tw), rows = Math.ceil(r.height / th);
+  while (cols * rows > MAX_TILES && tw < 80) { tw += 4; th += 4; cols = Math.ceil(r.width / tw); rows = Math.ceil(r.height / th); }
+
+  const out = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const w = Math.min(tw, r.width - col * tw);
+      const h = Math.min(th, r.height - row * th);
+      const x = r.left + col * tw, y = r.top + row * th;
+
+      const d = document.createElement('div');
+      d.className = 'bh-particle';
+      d.style.cssText =
+        `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+      d.style.backgroundImage = `url("${src.replace(/["\\()]/g, '\\$&')}")`;
+      d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
+      d.style.backgroundSize = `${r.width}px ${r.height}px`;
+      document.body.appendChild(d);
+
+      const cx = x + w / 2, cy = y + h / 2;
+      const dx = mx - cx, dy = my - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+      out.push({
+        el: d, x: cx, y: cy, ox: cx, oy: cy,
+        vx: (dx / dist) * INIT_SPEED * 0.5, vy: (dy / dist) * INIT_SPEED * 0.5, rot: 0
+      });
+    }
+  }
+  return out;
+}
+
+function _tileFallback(el, r, color) {
+  el.setAttribute('data-bh', '1');
+  el.style.visibility = 'hidden';
+  el.style.pointerEvents = 'none';
+
+  let tw = TILE_PX * 2, th = TILE_PX * 2;
+  let cols = Math.ceil(r.width / tw), rows = Math.ceil(r.height / th);
+  while (cols * rows > MAX_TILES && tw < 80) { tw += 4; th += 4; cols = Math.ceil(r.width / tw); rows = Math.ceil(r.height / th); }
+
+  const out = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const w = Math.min(tw, r.width - col * tw);
+      const h = Math.min(th, r.height - row * th);
+      const x = r.left + col * tw, y = r.top + row * th;
+
+      const d = document.createElement('div');
+      d.className = 'bh-particle';
+      d.style.cssText =
+        `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
+        `background:${color};pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+      document.body.appendChild(d);
+
+      const cx = x + w / 2, cy = y + h / 2;
+      const dx = mx - cx, dy = my - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+      out.push({
+        el: d, x: cx, y: cy, ox: cx, oy: cy,
+        vx: (dx / dist) * INIT_SPEED * 0.5, vy: (dy / dist) * INIT_SPEED * 0.5, rot: 0
+      });
+    }
+  }
   return out;
 }
 
