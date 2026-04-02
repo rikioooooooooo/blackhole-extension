@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Black Hole v7 DOM Test</title>
+<style>
+body { font-family: sans-serif; margin: 40px; line-height: 1.8; background: #fff; }
+h1 { font-size: 2em; margin-bottom: 20px; }
+p { margin-bottom: 16px; font-size: 16px; }
+.section { margin-bottom: 40px; }
+.highlight { background: #f0f0f0; padding: 20px; border-radius: 8px; }
+.gradient-box { height: 120px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 8px; color: #fff; }
+</style>
+<link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+
+<h1>Black Hole v7 DOM テスト</h1>
+
+<div class="section">
+<p>セクション1: これはテスト用のテキストです。ブラックホールがこの文字を吸い込んだ後、背景色は残って文字だけ消えます。</p>
+<p>ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789</p>
+<p>日本語テスト: あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん</p>
+<p>絵文字テスト: 😀🎉🚀💡🔥✨🌟⭐🎨🎵</p>
+</div>
+
+<div class="section highlight">
+<p>セクション2（背景色あり）: 灰色の背景を持っています。文字が消えても灰色は残る。</p>
+</div>
+
+<div class="gradient-box">
+<p>セクション3: グラデーション背景の上のテキスト。文字が消えてもグラデーションは残る。</p>
+</div>
+
+<div class="section" style="margin-top:40px;">
+<p>セクション4: リスト・箇条書きテスト</p>
+<ul>
+  <li>箇条書き1: ビュレット（•）も吸い込めるか</li>
+  <li>箇条書き2: テキストだけじゃなくマーカーも</li>
+  <li>箇条書き3: 全部消えるはず</li>
+</ul>
+<ol>
+  <li>番号付き1: 数字も吸い込まれる</li>
+  <li>番号付き2: 1. 2. 3. のマーカー</li>
+  <li>番号付き3: これも消える</li>
+</ol>
+</div>
+
+<div class="section" style="margin-top:20px;">
+<p>セクション5: スクロール後のテキスト。スクロールしても消した文字は復活しない。</p>
+<p>ABCDEFGHIJKLMNOPQRSTUVWXYZ — スクロールテスト用の追加テキスト。</p>
+</div>
+
+<div style="height:800px;"></div>
+
+<div class="section">
+<p>ページ下部: ここまでスクロールしても、上で消した文字は復活していないはず。</p>
+</div>
+
+<button id="toggle-btn" style="position:fixed;bottom:20px;right:20px;padding:12px 24px;background:#000;color:#fff;border:none;border-radius:8px;cursor:pointer;z-index:999999999;font-size:16px;">
+  BH ON/OFF
+</button>
+
+<!-- chrome API モック（テスト用） -->
+<script>
+window.chrome = {
+  runtime: {
+    onMessage: { addListener: function(){} },
+    sendMessage: function(msg) {
+      return new Promise((resolve) => { resolve({}); });
+    }
+  }
+};
+</script>
+<script src="../content.js"></script>
+<script>
+document.getElementById('toggle-btn').addEventListener('click', () => {
+  if (on) {
+    off();
+  } else {
+    activate();
+  }
+});
+</script>
+
+</body>
+</html>

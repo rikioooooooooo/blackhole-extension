@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#8B5CF6" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#8B5CF6" stop-opacity="0.4"/>
+      <stop offset="80%" stop-color="#8B5CF6" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ring" cx="50%" cy="50%" r="50%">
+      <stop offset="40%" stop-color="#8B5CF6" stop-opacity="0"/>
+      <stop offset="60%" stop-color="#8B5CF6"/>
+      <stop offset="75%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1E1432"/>
+      <stop offset="100%" stop-color="#000000"/>
+    </radialGradient>
+  </defs>
+  <rect width="48" height="48" fill="transparent"/>
+  <circle cx="24" cy="24" r="23.760000000000005" fill="url(#glow)"/>
+  <circle cx="24" cy="24" r="21.6" fill="url(#ring)"/>
+  <circle cx="24" cy="24" r="10.8" fill="url(#core)"/>
+</svg>
