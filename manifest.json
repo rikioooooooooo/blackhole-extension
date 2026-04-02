@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Black Hole",
-  "version": "1.0",
-  "description": "ブラウザのコンテンツをブラックホールで吸い込む遊び",
+  "version": "1.0.0",
+  "description": "Suck web page content into a black hole. Click the icon, move your mouse, and watch everything get absorbed!",
   "permissions": ["activeTab", "scripting"],
   "host_permissions": ["<all_urls>"],
   "action": {
@@ -16,12 +16,9 @@
   "background": {
     "service_worker": "background.js"
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "css": ["styles.css"],
-      "run_at": "document_idle"
-    }
-  ]
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
 }

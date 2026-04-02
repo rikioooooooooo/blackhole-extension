@@ -1,28 +1,36 @@
-# Black Hole — Chrome拡張機能
+# Black Hole — Chrome Extension
 
-ブラウザのコンテンツをブラックホールで吸い込んで遊ぶChrome拡張機能。
+Suck web page content into a black hole! Click the icon, move your mouse, and watch text, images, videos, and everything on the page get physically absorbed into a growing black hole.
 
-## インストール
+## Features
 
-1. `chrome://extensions/` を開く
-2. 右上の「デベロッパーモード」をONにする
-3. 「パッケージ化されていない拡張機能を読み込む」をクリック
-4. このフォルダ（`blackhole-extension`）を選択
+- **Text absorption** — Characters are individually detected and fly into the black hole as physics objects
+- **Images & Videos** — Thumbnails, videos, and canvases are tile-shattered and sucked in
+- **SVG, iframes, buttons** — Almost any web element can be absorbed
+- **Background preserved** — Only content disappears; page backgrounds remain visible
+- **Scroll-proof** — Absorbed content stays gone even after scrolling
+- **Restore animation** — Right-click or click the icon again to release everything back
+- **Infinite growth** — The black hole grows with every absorption, with dramatic step-wise jumps
+- **YouTube-safe** — Blocks hover autoplay when the effect is active
 
-## 遊び方
+## Install from Chrome Web Store
 
-1. 任意のWebサイト（例: Wikipedia）を開く
-2. ツールバーの Black Hole アイコンをクリック → ON
-3. マウスを動かしてコンテンツを吸い込む
-4. もう一度アイコンをクリック → OFF（リロードで元に戻る）
+Coming soon!
 
-## 演出の段階
+## Install manually (Developer Mode)
 
-| サイズ | 演出 |
-|--------|------|
-| 60〜149px | 通常モード |
-| 150px〜 | 回転高速化、赤色追加、環境パーティクル |
-| 200px〜 | fixed要素も吸引、周囲の歪み演出 |
-| 300px〜 | サイズ制限撤廃、画面暗転、オレンジ〜赤 |
-| 400px〜 | 要素の自動引き寄せ |
-| 500px | 回転最速、画面振動 |
+1. Download or clone this repository
+2. Open `chrome://extensions/`
+3. Enable "Developer mode" (top right)
+4. Click "Load unpacked" and select this folder
+
+## How to play
+
+1. Open any website
+2. Click the Black Hole icon in the toolbar → ON
+3. Move your mouse to absorb content
+4. Right-click or click the icon again → OFF (everything restores)
+
+## Privacy
+
+This extension collects no data. See [Privacy Policy](PRIVACY.md).

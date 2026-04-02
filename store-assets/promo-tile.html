@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  width: 440px; height: 280px; overflow: hidden;
+  background: radial-gradient(ellipse at center, #1a0a2e 0%, #0a0014 60%, #000 100%);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  position: relative;
+}
+
+/* 星 */
+.stars { position: absolute; inset: 0; }
+.star {
+  position: absolute; width: 2px; height: 2px; background: #fff;
+  border-radius: 50%; opacity: 0.6;
+}
+
+/* ブラックホール */
+.bh {
+  width: 120px; height: 120px; border-radius: 50%;
+  background: radial-gradient(circle, #000 40%, transparent 70%);
+  box-shadow:
+    0 0 40px 10px rgba(139, 92, 246, 0.4),
+    0 0 80px 20px rgba(59, 130, 246, 0.2),
+    inset 0 0 30px 10px #000;
+  position: relative; z-index: 2;
+  animation: pulse 3s ease-in-out infinite;
+}
+
+/* 降着円盤 */
+.bh::before {
+  content: '';
+  position: absolute;
+  width: 160px; height: 160px;
+  top: -20px; left: -20px;
+  border-radius: 50%;
+  border: 2px solid rgba(139, 92, 246, 0.3);
+  box-shadow: 0 0 20px rgba(139, 92, 246, 0.2);
+  animation: spin 4s linear infinite;
+}
+
+.title {
+  color: #fff; font-size: 32px; font-weight: 700;
+  margin-top: 20px; z-index: 2;
+  text-shadow: 0 0 20px rgba(139, 92, 246, 0.5);
+  letter-spacing: 4px;
+}
+
+.subtitle {
+  color: rgba(255,255,255,0.6); font-size: 13px;
+  margin-top: 6px; z-index: 2;
+  letter-spacing: 1px;
+}
+
+/* 吸い込まれる文字 */
+.char {
+  position: absolute; color: rgba(255,255,255,0.7);
+  font-size: 14px; z-index: 1;
+  animation: suck 3s ease-in infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@keyframes suck {
+  0% { opacity: 0.8; transform: translate(0, 0) scale(1); }
+  100% { opacity: 0; transform: translate(var(--dx), var(--dy)) scale(0); }
+}
+</style>
+</head>
+<body>
+  <div class="stars"></div>
+  <div class="bh"></div>
+  <div class="title">BLACK HOLE</div>
+  <div class="subtitle">Absorb everything on any web page</div>
+
+  <script>
+    // 星を配置
+    const stars = document.querySelector('.stars');
+    for (let i = 0; i < 50; i++) {
+      const s = document.createElement('div');
+      s.className = 'star';
+      s.style.left = Math.random() * 440 + 'px';
+      s.style.top = Math.random() * 280 + 'px';
+      s.style.opacity = Math.random() * 0.8 + 0.2;
+      s.style.width = s.style.height = (Math.random() * 2 + 1) + 'px';
+      stars.appendChild(s);
+    }
+
+    // 吸い込まれる文字を配置
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZあいうえお01234'.split('');
+    const body = document.body;
+    for (let i = 0; i < 15; i++) {
+      const c = document.createElement('span');
+      c.className = 'char';
+      c.textContent = chars[Math.floor(Math.random() * chars.length)];
+      const x = Math.random() * 400 + 20;
+      const y = Math.random() * 240 + 20;
+      c.style.left = x + 'px';
+      c.style.top = y + 'px';
+      c.style.setProperty('--dx', (220 - x) * 0.8 + 'px');
+      c.style.setProperty('--dy', (100 - y) * 0.8 + 'px');
+      c.style.animationDelay = (Math.random() * 3) + 's';
+      body.appendChild(c);
+    }
+  </script>
+</body>
+</html>
