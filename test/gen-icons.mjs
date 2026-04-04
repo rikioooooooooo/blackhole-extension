@@ -19,20 +19,13 @@ const HTML = `<!DOCTYPE html>
 * { margin:0; padding:0; }
 body { background: transparent; }
 </style></head><body>
-<svg id="icon" viewBox="0 0 648.37 444.18" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg id="icon" viewBox="-15 -15 678 474" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="ks" x1="30%" y1="0%" x2="70%" y2="100%">
       <stop offset="0%" stop-color="#c4b5fd" />
       <stop offset="100%" stop-color="#8b5cf6" />
     </linearGradient>
-    <linearGradient id="bg" x1="50%" y1="0%" x2="50%" y2="100%">
-      <stop offset="0%" stop-color="#2e1065" />
-      <stop offset="100%" stop-color="#1e0a3c" />
-    </linearGradient>
   </defs>
-
-  <!-- 背景円 -->
-  <circle cx="324" cy="222" r="230" fill="url(#bg)" />
 
   <!-- おしり塗り -->
   <path fill="url(#ks)" d="M292,57.07S411.85,1.16,490.27,32.83c37.48,15.14,144.72,78.99,147.82,187.62,3.1,108.63-66.7,158.21-66.7,158.21,0,0-69.33,58.49-149.28,57.7s-78.89-21.17-78.89-21.17l-21.41,2.37-33.97-56.73,40.88-94.62-36.73-209.14" />

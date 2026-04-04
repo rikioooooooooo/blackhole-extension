@@ -50,6 +50,9 @@ let raf = null, ambId = null, ambCnt = 0;
 let lastTs = 0, samplePhase = 0, prevMx = 0, prevMy = 0;
 let totalAbsorbed = 0;
 
+/* ==== こすくま保護 ==== */
+const KOSUKUMA_RE = /こすくま|こす\.くま|kosukuma|kosu\.kuma/i;
+
 /* 階段式成長テーブル: [吸収数, ジャンプ先サイズ] */
 const GROWTH_STEPS = [
   [90,    28],
@@ -133,6 +136,7 @@ function activate() {
 /* ==== OFF — 復元アニメーション ==== */
 function off() {
   toggling = true; on = false;
+
 
   // ループ・入力を即停止
   if (raf) { cancelAnimationFrame(raf); raf = null; }
@@ -397,6 +401,55 @@ function updSz() {
 }
 
 /* ================================================================
+   モード — フィルタリング関数
+   ================================================================ */
+
+/** こすくま保護: 指定オフセットの文字が保護ワードの一部か判定 */
+function isProtectedChar(tn, offset) {
+  // テキストノード自体と親・祖父要素のテキストを探索
+  const sources = [tn.textContent];
+  const p = tn.parentElement;
+  if (p) {
+    const pt = p.textContent;
+    if (pt.length < 500) sources.push(pt);
+    const gp = p.parentElement;
+    if (gp) {
+      const gt = gp.textContent;
+      if (gt.length < 500) sources.push(gt);
+    }
+  }
+
+  // テキストノード内でのオフセットを使って判定
+  const text = tn.textContent;
+  let match;
+  const re = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
+  while ((match = re.exec(text)) !== null) {
+    if (offset >= match.index && offset < match.index + match[0].length) return true;
+  }
+
+  // 親・祖父要素内で分割されたケース: テキストノードの前後のテキストを結合して判定
+  if (p) {
+    let accumulated = 0;
+    const walker = document.createTreeWalker(p, NodeFilter.SHOW_TEXT, null);
+    let n;
+    let fullText = '';
+    let globalOffset = -1;
+    while ((n = walker.nextNode())) {
+      if (n === tn) globalOffset = fullText.length + offset;
+      fullText += n.textContent;
+    }
+    if (globalOffset >= 0 && fullText.length < 500) {
+      const re2 = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
+      while ((match = re2.exec(fullText)) !== null) {
+        if (globalOffset >= match.index && globalOffset < match.index + match[0].length) return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/* ================================================================
    メインループ
    ================================================================ */
 function loop(ts) {
@@ -480,6 +533,9 @@ function peel() {
         const cpLen = cpLength(tn.textContent, offset);
         const ch = tn.textContent.slice(offset, offset + cpLen);
         if (ch && ch !== '\n' && ch !== '\r' && ch !== '\t' && ch.trim()) {
+          // こすくま保護: この文字がこすくまワードの一部ならスキップ
+          if (isProtectedChar(tn, offset)) continue;
+
           const rc = charRect(tn, offset, cpLen);
           if (rc && rc.width > 0.3 && rc.height > 0.3) {
             const pe = tn.parentElement;
@@ -1054,6 +1110,8 @@ function peelShadow(root) {
       const cpLen = cpLength(text, i);
       const ch = text.slice(i, i + cpLen);
       if (!ch.trim()) continue;
+      // こすくま保護: この文字が保護ワードの一部ならスキップ
+      if (isProtectedChar(node, i)) continue;
       const rc = charRect(node, i, cpLen);
       if (!rc || rc.width < 0.3 || rc.height < 0.3) continue;
       const span = eraseChar(node, i, cpLen);
