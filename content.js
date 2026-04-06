@@ -69,6 +69,23 @@ function getCachedPosition(el) {
 
 const _bgCache = new WeakMap();
 let _bgCacheGen = 0;
+
+const _visTextCache = new WeakMap();
+let _visTextGen = 0;
+
+/* ==== Full computed style cache (fontSize, fontFamily, fontWeight, color) ==== */
+const _fullStyleCache = new WeakMap();
+let _fullStyleGen = 0;
+function getCachedFullStyle(el) {
+  const c = _fullStyleCache.get(el);
+  if (c && c.gen === _fullStyleGen) return c;
+  const s = getComputedStyle(el);
+  const entry = { fontSize: s.fontSize, fontFamily: s.fontFamily,
+                  fontWeight: s.fontWeight, color: s.color, gen: _fullStyleGen };
+  _fullStyleCache.set(el, entry);
+  return entry;
+}
+
 function getCachedBgImage(el) {
   const cached = _bgCache.get(el);
   if (cached && cached.gen === _bgCacheGen) return cached.bg;
@@ -87,11 +104,11 @@ const _dirtyParents = new Set();
 let _lastNormalize = 0;
 function maybeNormalize(ts) {
   if (_dirtyParents.size === 0) return;
-  if (ts - _lastNormalize < 3000) return;
+  if (ts - _lastNormalize < 1000) return;
   _lastNormalize = ts;
   let count = 0;
   for (const el of _dirtyParents) {
-    if (count >= 20) break;
+    if (count >= 50) break;
     try { el.normalize(); } catch {}
     _dirtyParents.delete(el);
     count++;
@@ -99,7 +116,7 @@ function maybeNormalize(ts) {
 }
 
 /* ==== こすくま保護 ==== */
-const KOSUKUMA_RE = /こすくま|こす\.くま|kosukuma|kosu\.kuma/i;
+const KOSUKUMA_RE = /こすくま|こす[.．・]くま|kosukuma|kosu[._\-]kuma/i;
 
 /* 階段式成長テーブル: [吸収数, ジャンプ先サイズ] */
 const GROWTH_STEPS = [
@@ -168,6 +185,7 @@ function activate() {
   if (!document.body) { toggling = false; return; }
   toggling = true;
   on = true;
+  _suppressMutationHandler = true; // activate〜最初のloop間のフレームワーク再レンダー防止
   sz = BH_INITIAL; ambCnt = 0; samplePhase = 0;
   bodies.length = 0; lastTs = 0; totalAbsorbed = 0;
   prevMx = mx; prevMy = my;
@@ -455,18 +473,7 @@ function updSz() {
 
 /** こすくま保護: 指定オフセットの文字が保護ワードの一部か判定 */
 function isProtectedChar(tn, offset) {
-  // テキストノード自体と親・祖父要素のテキストを探索
-  const sources = [tn.textContent];
   const p = tn.parentElement;
-  if (p) {
-    const pt = p.textContent;
-    if (pt.length < 500) sources.push(pt);
-    const gp = p.parentElement;
-    if (gp) {
-      const gt = gp.textContent;
-      if (gt.length < 500) sources.push(gt);
-    }
-  }
 
   // テキストノード内でのオフセットを使って判定
   const text = tn.textContent;
@@ -487,7 +494,7 @@ function isProtectedChar(tn, offset) {
       if (n === tn) globalOffset = fullText.length + offset;
       fullText += n.textContent;
     }
-    if (globalOffset >= 0 && fullText.length < 500) {
+    if (globalOffset >= 0 && fullText.length < 2000) {
       const re2 = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
       while ((match = re2.exec(fullText)) !== null) {
         if (globalOffset >= match.index && globalOffset < match.index + match[0].length) return true;
@@ -501,28 +508,45 @@ function isProtectedChar(tn, offset) {
 /* ================================================================
    メインループ
    ================================================================ */
+let skipPeel = false;
+let _skipPeelFrames = 0;
+
 function loop(ts) {
   if (!on) return;
   const dt = lastTs ? Math.min((ts - lastTs) / 1000, 0.05) : 0.016;
   lastTs = ts;
+  const frameStart = performance.now();
 
   // フレーム全体でMutationObserverを抑制
   _suppressMutationHandler = true;
 
-  updPos();
-  if (szDirty) { updSz(); szDirty = false; }
-
+  // Cache gen bump (reads happen in peel, before writes)
   _posCacheGen++;
   _bgCacheGen++;
+  _visTextGen++;
+  _fullStyleGen++;
 
-  peel();
+  // Phase 1: Layout reads (peel) — before any style writes
+  const moved = Math.hypot(mx - prevMx, my - prevMy) > 2;
+  if (_skipPeelFrames > 0) {
+    _skipPeelFrames--;
+  } else if (!skipPeel || moved) {
+    peel();
+  }
+
+  // Phase 2: Style writes (physics + position)
   physicsAndAbsorb(dt);
+  if (szDirty) { updSz(); szDirty = false; }
+  updPos();
   trySpawnAmb(ts);
   maybeNormalize(ts);
 
   // フレーム終了: 溜まったmutationを破棄してからobserver再開
   spaObs.takeRecords();
   _suppressMutationHandler = false;
+
+  const elapsed = performance.now() - frameStart;
+  skipPeel = elapsed > 12 && bodies.length > 200;
 
   raf = requestAnimationFrame(loop);
 }
@@ -591,21 +615,28 @@ function peel() {
   prevMx = mx; prevMy = my;
 
   _triedEls.clear();
-  _posCacheGen++;
   let n = 0;
   let caretCalls = 0;
   let elemCalls = 0;
   const MAX_CARET_PER_FRAME = 12;
   const MAX_ELEM_PER_FRAME = 16;
+  const PEEL_BUDGET_MS = 4;
+  const peelStart = performance.now();
+
+  /* ---- Pass 1: READ — collect all hits without DOM writes ---- */
+  const textHits = [];   // { tn, offset, cpLen, parentEl, charRect }
+  const elemHits = [];   // { type, el, rect?, img?, bgImg? }
 
   for (let pi = 0; pi < _ptsLen; pi += 2) {
     if (n >= rate) break;
+    if (performance.now() - peelStart > PEEL_BUDGET_MS) break;
     const px = _ptsFlat[pi], py = _ptsFlat[pi + 1];
 
-    // ① テキスト文字を検出
+    // ① テキスト文字を検出 (READ only)
     if (caretCalls < MAX_CARET_PER_FRAME) {
       const range = document.caretRangeFromPoint(px, py);
       caretCalls++;
+      if (performance.now() - peelStart > PEEL_BUDGET_MS) break;
       if (range && range.startContainer.nodeType === 3) {
         const tn = range.startContainer;
         const offset = range.startOffset;
@@ -622,11 +653,8 @@ function peel() {
                 const pos = getCachedPosition(pe);
                 if (pos === 'fixed' || pos === 'sticky') continue;
               }
-              const span = eraseChar(tn, offset, cpLen);
-              if (span) {
-                mkCharBody(span, rc, pe);
-                n++;
-              }
+              textHits.push({ tn, offset, cpLen, parentEl: pe, charRect: rc });
+              n++;
               continue;
             }
           }
@@ -634,10 +662,11 @@ function peel() {
       }
     }
 
-    // ② 非テキスト要素を検出
+    // ② 非テキスト要素を検出 (READ only)
     if (elemCalls >= MAX_ELEM_PER_FRAME) continue;
     const el = document.elementFromPoint(px, py);
     elemCalls++;
+    if (performance.now() - peelStart > PEEL_BUDGET_MS) break;
     if (!el || _triedEls.has(el)) continue;
     _triedEls.add(el);
     if (SKIP.has(el.tagName)) continue;
@@ -653,45 +682,40 @@ function peel() {
     }
 
     if (hasVisibleText(el)) {
-      peelPseudo(el);
+      elemHits.push({ type: 'pseudo', el });
       continue;
     }
 
     if (el.tagName === 'IMG' || el.tagName === 'PICTURE') {
       const img = el.tagName === 'PICTURE' ? el.querySelector('img') : el;
       if (img) {
-        const bs = tileImg(img);
-        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-        n += bs.length;
+        elemHits.push({ type: 'img', el: img });
+        n++;
       }
       continue;
     }
 
     if (el.tagName === 'VIDEO') {
-      const bs = tileVideo(el);
-      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-      n += bs.length;
+      elemHits.push({ type: 'video', el });
+      n++;
       continue;
     }
 
     if (el.tagName === 'CANVAS') {
-      const bs = tileCanvas(el);
-      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-      n += bs.length;
+      elemHits.push({ type: 'canvas', el });
+      n++;
       continue;
     }
 
     if (el.tagName === 'svg' || el.tagName === 'SVG' || el instanceof SVGElement) {
-      const bs = tileSVG(el);
-      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-      n += bs.length;
+      elemHits.push({ type: 'svg', el });
+      n++;
       continue;
     }
 
     if (el.tagName === 'IFRAME') {
-      const bs = tileIframe(el);
-      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-      n += bs.length;
+      elemHits.push({ type: 'iframe', el });
+      n++;
       continue;
     }
 
@@ -699,14 +723,13 @@ function peel() {
     if (r.width < 2 || r.height < 2) continue;
 
     if (el.shadowRoot) {
-      peelShadow(el.shadowRoot);
+      elemHits.push({ type: 'shadow', el, shadowRoot: el.shadowRoot });
     }
 
     const bgImg = getCachedBgImage(el);
     if (bgImg && bgImg !== 'none' && !hasVisibleText(el)) {
-      const bs = tileBgImage(el, r, bgImg);
-      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-      n += bs.length;
+      elemHits.push({ type: 'bgImage', el, rect: r, bgImg });
+      n++;
       continue;
     }
 
@@ -714,15 +737,88 @@ function peel() {
 
     if (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') {
       if (!hasVisibleText(el) || el.tagName === 'INPUT') {
-        absorbEl(el, r);
+        elemHits.push({ type: 'absorb', el, rect: r });
         n++;
         continue;
       }
     }
 
-    peelPseudo(el);
-    absorbEl(el, r);
+    elemHits.push({ type: 'absorbWithPseudo', el, rect: r });
     n++;
+  }
+
+  /* ---- Pass 2: WRITE — apply DOM mutations from collected hits ---- */
+
+  // Text hits: sort by descending offset within each textNode so that
+  // erasing later characters first preserves earlier offsets.
+  textHits.sort((a, b) => a.tn === b.tn ? b.offset - a.offset : 0);
+  for (let i = 0; i < textHits.length; i++) {
+    const hit = textHits[i];
+    const span = eraseChar(hit.tn, hit.offset, hit.cpLen);
+    if (span) {
+      mkCharBody(span, hit.charRect, hit.parentEl);
+      // eraseCharがreplaceChildで元textNodeを破壊するため、
+      // 同じtextNodeへの残りヒットを新しい"before"テキストノードに差し替える
+      const beforeNode = span.previousSibling;
+      if (beforeNode && beforeNode.nodeType === 3) {
+        const destroyed = hit.tn;
+        for (let j = i + 1; j < textHits.length; j++) {
+          if (textHits[j].tn === destroyed) {
+            textHits[j].tn = beforeNode;
+          }
+        }
+      }
+    }
+  }
+
+  // Element hits: dispatch by type
+  for (let i = 0; i < elemHits.length; i++) {
+    const hit = elemHits[i];
+    switch (hit.type) {
+      case 'pseudo':
+        peelPseudo(hit.el);
+        break;
+      case 'img': {
+        const bs = tileImg(hit.el);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        break;
+      }
+      case 'video': {
+        const bs = tileVideo(hit.el);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        break;
+      }
+      case 'canvas': {
+        const bs = tileCanvas(hit.el);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        break;
+      }
+      case 'svg': {
+        const bs = tileSVG(hit.el);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        break;
+      }
+      case 'iframe': {
+        const bs = tileIframe(hit.el);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        break;
+      }
+      case 'shadow':
+        peelShadow(hit.shadowRoot);
+        break;
+      case 'bgImage': {
+        const bs = tileBgImage(hit.el, hit.rect, hit.bgImg);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        break;
+      }
+      case 'absorb':
+        absorbEl(hit.el, hit.rect);
+        break;
+      case 'absorbWithPseudo':
+        peelPseudo(hit.el);
+        absorbEl(hit.el, hit.rect);
+        break;
+    }
   }
 }
 
@@ -754,8 +850,9 @@ function peelPseudo(el) {
     }
     if (markerText) {
       const r = el.getBoundingClientRect();
-      const st = getComputedStyle(el);
-      const paddingLeft = parseFloat(st.paddingLeft) || 0;
+      const st = getCachedFullStyle(el);
+      const rawSt = getComputedStyle(el);
+      const paddingLeft = parseFloat(rawSt.paddingLeft) || 0;
       // マーカーは要素の左側、パディングの前に描画される
       const markerR = {
         left: r.left - paddingLeft - 20,
@@ -793,7 +890,12 @@ function peelPseudo(el) {
   _pseudoHandled.add(el);
 }
 
-function mkPseudoBody(text, rc, st) {
+function mkPseudoBody(text, rc, rawSt) {
+  // rawSt may be CSSStyleDeclaration (from pseudo) or cached entry; normalize
+  const st = rawSt.gen !== undefined ? rawSt : {
+    fontSize: rawSt.fontSize, fontFamily: rawSt.fontFamily,
+    fontWeight: rawSt.fontWeight, color: rawSt.color
+  };
   const p = document.createElement('span');
   p.className = 'bh-particle';
   p.textContent = text;
@@ -845,7 +947,7 @@ function eraseChar(tn, offset, cpLen) {
 /* ---- 1文字のテキストパーティクル生成 ---- */
 function mkCharBody(span, rc, parentEl) {
   const pe = parentEl || span.parentElement;
-  const st = pe ? getComputedStyle(pe) : null;
+  const st = pe ? getCachedFullStyle(pe) : null;
   const p = document.createElement('span');
   p.className = 'bh-particle';
   p.textContent = span.textContent;
@@ -867,8 +969,17 @@ function mkCharBody(span, rc, parentEl) {
   });
 }
 
+/* ---- 要素にこすくま保護テキストが含まれるか判定 ---- */
+function containsProtectedText(el) {
+  const text = el.textContent;
+  if (!text) return false;
+  return KOSUKUMA_RE.test(text);
+}
+
 /* ---- 要素の単体吸収 ---- */
 function absorbEl(el, r) {
+  // こすくま保護: 保護テキストを含む要素は吸収しない
+  if (containsProtectedText(el)) return;
   el.setAttribute('data-bh', '1');
   el.style.visibility = 'hidden';
   el.style.pointerEvents = 'none';
@@ -1294,6 +1405,8 @@ function physicsAndAbsorb(dt) {
   const damp = Math.pow(DAMPING, dt * 60);
   const coreSq = (sz * 0.6) * (sz * 0.6);
   let write = 0;
+  let absorbCount = 0;
+  const MAX_ABSORB_PER_FRAME = 30;
 
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i];
@@ -1302,9 +1415,9 @@ function physicsAndAbsorb(dt) {
     const distSq = dx * dx + dy * dy;
 
     // 吸収判定（distSq再利用でsqrt不要）
-    if (distSq < coreSq) {
+    if (distSq < coreSq && absorbCount < MAX_ABSORB_PER_FRAME) {
       b.el.remove();
-      grow();
+      absorbCount++;
       continue;
     }
 
@@ -1352,28 +1465,38 @@ function physicsAndAbsorb(dt) {
     bodies[write++] = b;
   }
   bodies.length = write;
+
+  // バッチ適用（ループ外で1回だけ）
+  growBatch(absorbCount);
 }
 
-function grow() {
-  totalAbsorbed++;
+function growBatch(count) {
+  if (count === 0) return;
+  totalAbsorbed += count;
+
+  // 階段判定: totalAbsorbedが超えた最大のステップまで一気にジャンプ
   let stepped = false;
   for (const [threshold, jumpSz] of GROWTH_STEPS) {
-    if (totalAbsorbed === threshold && sz < jumpSz) {
+    if (totalAbsorbed >= threshold && sz < jumpSz) {
       sz = jumpSz;
       stepped = true;
-      break;
+      // breakしない — 複数ステップ飛ぶ可能性
     }
   }
+
   if (!stepped) {
-    sz += GROW_RATE;
+    sz += GROW_RATE * count;
   }
 
   if (stepped) {
     updSz();
-    if (ctr) {
-      ctr.animate([
-        { transform: `translate(${mx}px,${my}px) scale(1.15)` },
-        { transform: `translate(${mx}px,${my}px) scale(1)` }
+    _skipPeelFrames = 2;
+    // Animate .bh-core child instead of ctr to avoid WAAPI conflict with updPos() transform
+    const core = ctr && ctr.querySelector('.bh-core');
+    if (core) {
+      core.animate([
+        { transform: 'translate(-50%,-50%) scale(1.15)' },
+        { transform: 'translate(-50%,-50%) scale(1)' }
       ], { duration: 300, easing: 'ease-out' });
     }
   } else {
@@ -1456,13 +1579,14 @@ function charRect(tn, i, len) {
 
 function hasVisibleText(el) {
   if (el.tagName && LEAF_TAGS.has(el.tagName)) return false;
-  // テキストノードを再帰走査し、可視テキストが残っているかチェック
+  const cached = _visTextCache.get(el);
+  if (cached && cached.gen === _visTextGen) return cached.val;
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-  let node;
+  let node, val = false;
   while ((node = walker.nextNode())) {
-    // data-bh-erased span内のテキストは無視（既に透明化済み）
     if (node.parentElement && node.parentElement.hasAttribute('data-bh-erased')) continue;
-    if (node.textContent.trim()) return true;
+    if (node.textContent.trim()) { val = true; break; }
   }
-  return false;
+  _visTextCache.set(el, { val, gen: _visTextGen });
+  return val;
 }
