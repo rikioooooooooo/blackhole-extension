@@ -210,6 +210,14 @@ function activate() {
   bodies.length = 0; lastTs = 0; totalAbsorbed = 0;
   prevMx = mx; prevMy = my;
 
+  // data-bh-erased CSS rule注入（ページCSSの!importantに負けない二重防御）
+  if (!document.getElementById('bh-erased-style')) {
+    const st = document.createElement('style');
+    st.id = 'bh-erased-style';
+    st.textContent = '[data-bh-erased]{color:transparent!important}';
+    document.head.appendChild(st);
+  }
+
   mkBH();
   document.addEventListener('mousemove', onM);
   document.addEventListener('contextmenu', onRC);
@@ -306,8 +314,12 @@ function off() {
 
   let completed = 0;
   const total = restoreJobs.length;
-  const TOTAL_LAUNCH_MS = Math.min(1200, total * 3);  // 大量の場合は短縮
-  const STAGGER = Math.max(1, Math.min(20, TOTAL_LAUNCH_MS / total));
+  // 3秒デッドライン: 発射2秒 + 最後のアニメ飛行0.8秒 + fadeout余裕0.2秒
+  const DEADLINE_MS = 3000;
+  const MAX_ANIM_DUR = 800;
+  const LAUNCH_BUDGET = DEADLINE_MS - MAX_ANIM_DUR - 200;  // 2000ms
+  const TOTAL_LAUNCH_MS = Math.min(LAUNCH_BUDGET, total * 3);
+  const STAGGER = Math.max(0.5, TOTAL_LAUNCH_MS / total);
   const startSz = sz;
 
   restoreJobs.forEach((job, i) => {
@@ -334,6 +346,17 @@ function off() {
     }, i * STAGGER);
     tids.add(tid);
   });
+
+  // デッドラインタイマー: 3秒で強制完了
+  const deadlineTid = setTimeout(() => {
+    tids.delete(deadlineTid);
+    if (completed < total) {
+      for (const t of tids) clearTimeout(t);
+      tids.clear();
+      finishOff();
+    }
+  }, DEADLINE_MS);
+  tids.add(deadlineTid);
 
   document.removeEventListener('mousemove', onM);
 }
@@ -374,7 +397,11 @@ function launchRestore(job, bhX, bhY, total, onDone) {
   const midY = dy * 0.5 + perpY * curve;
   const rotDir = (Math.random() - 0.5) * 720;
 
-  const dur = total > 200 ? 300 + Math.random() * 200 : 600 + Math.random() * 400;
+  // totalが多いほどアニメを短縮（3秒に収める）
+  const dur = total > 500 ? 150 + Math.random() * 150
+            : total > 200 ? 250 + Math.random() * 200
+            : total > 50  ? 400 + Math.random() * 300
+            :               500 + Math.random() * 300;
 
   const anim = p.animate([
     { transform: 'scale(0) rotate(0deg)', opacity: 0 },
@@ -430,6 +457,10 @@ function finishOff() {
   for (const el of befores) el.removeAttribute('data-bh-before');
   const afters = document.querySelectorAll('[data-bh-after]');
   for (const el of afters) el.removeAttribute('data-bh-after');
+
+  // erased style rule除去
+  const erasedStyle = document.getElementById('bh-erased-style');
+  if (erasedStyle) erasedStyle.remove();
 
   for (const t of tids) clearTimeout(t);
   tids.clear();
@@ -1074,7 +1105,7 @@ function eraseChar(tn, offset, cpLen) {
     // 消した文字を<span>でラップ
     const span = document.createElement('span');
     span.textContent = ch;
-    span.style.color = 'transparent';
+    span.style.setProperty('color', 'transparent', 'important');
     span.setAttribute('data-bh-erased', '1');
 
     const frag = document.createDocumentFragment();
