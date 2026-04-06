@@ -49,30 +49,57 @@ let ctr = null;
 let raf = null, ambId = null, ambCnt = 0;
 let lastTs = 0, samplePhase = 0, prevMx = 0, prevMy = 0;
 let totalAbsorbed = 0;
+
 let szDirty = false;
 let lastPosMx = -1, lastPosMy = -1;
 
-/* ==== バネ物理（ヌルっとした追従） ==== */
-let bhx = 0, bhy = 0;         // BH描画位置（バネ出力）
-let bhvx = 0, bhvy = 0;       // BH速度
-const SPRING_K = 320;          // バネ定数（大きい＝速く追従）
-const SPRING_DAMP = 22;        // 減衰（大きい＝オーバーシュート少ない）
+/* ==== MutationObserver フレーム抑制 ==== */
+let _suppressMutationHandler = false;
 
-/* ==== テール（影の尾） ==== */
-let tailEl = null;
-let tailX = 0, tailY = 0;     // テール位置（さらに遅れる）
-const TAIL_LAG = 0.06;         // テールの追従係数（小さい＝遅い）
+/* ==== getComputedStyle キャッシュ（毎フレームのstyle recalc回避） ==== */
+const _posCache = new WeakMap();
+let _posCacheGen = 0;
+function getCachedPosition(el) {
+  const cached = _posCache.get(el);
+  if (cached && cached.gen === _posCacheGen) return cached.pos;
+  const pos = getComputedStyle(el).position;
+  _posCache.set(el, { pos, gen: _posCacheGen });
+  return pos;
+}
 
-/* ==== こすくま保護（Ctrl+F方式 — 高速版） ==== */
-const KOSUKUMA_WORDS = ['こすくま', 'こす.くま', 'こす．くま', 'こす・くま', 'こす｡くま', 'kosukuma', 'kosu.kuma'];
+const _bgCache = new WeakMap();
+let _bgCacheGen = 0;
+function getCachedBgImage(el) {
+  const cached = _bgCache.get(el);
+  if (cached && cached.gen === _bgCacheGen) return cached.bg;
+  const bg = getComputedStyle(el).backgroundImage;
+  _bgCache.set(el, { bg, gen: _bgCacheGen });
+  return bg;
+}
 
-/* ==== こすくま保護エンジン（高速版） ====
- * 設計: 起動時1回のスキャンで全保護情報を事前計算し、
- *       ランタイムはWeakMapルックアップ(O(1))のみ。
- */
-const _protectedRanges = new WeakMap();
-const _protectedElements = new WeakSet();
-const _KOSUKUMA_RE = /こすくま|こす[.．・｡]くま|kosukuma|kosu[.]kuma/gi;
+/* ==== Per-frame collection pools (GC圧力削減) ==== */
+let _ptsFlat = new Float64Array(512);
+let _ptsLen = 0;
+const _triedEls = new Set();
+
+/* ==== DOM defrag ==== */
+const _dirtyParents = new Set();
+let _lastNormalize = 0;
+function maybeNormalize(ts) {
+  if (_dirtyParents.size === 0) return;
+  if (ts - _lastNormalize < 3000) return;
+  _lastNormalize = ts;
+  let count = 0;
+  for (const el of _dirtyParents) {
+    if (count >= 20) break;
+    try { el.normalize(); } catch {}
+    _dirtyParents.delete(el);
+    count++;
+  }
+}
+
+/* ==== こすくま保護 ==== */
+const KOSUKUMA_RE = /こすくま|こす\.くま|kosukuma|kosu\.kuma/i;
 
 /* 階段式成長テーブル: [吸収数, ジャンプ先サイズ] */
 const GROWTH_STEPS = [
@@ -89,77 +116,6 @@ const tids      = new Set();
 const bodies    = [];
 const ambParts  = new Set();
 
-/* ==== DOM断片化デフラグ ==== */
-const _dirtyParents = new Set();
-let _lastNormalize = 0;
-
-function maybeNormalize(ts) {
-  if (_dirtyParents.size === 0) return;
-  if (ts - _lastNormalize < 3000) return; // 3秒に1回
-  _lastNormalize = ts;
-  let count = 0;
-  for (const el of _dirtyParents) {
-    if (count >= 20) break; // 1フレームあたり最大20件 — 大量吸い込み時のスパイク防止
-    try { el.normalize(); } catch { /* removed from DOM */ }
-    _dirtyParents.delete(el);
-    count++;
-  }
-}
-
-/* ==== getComputedStyle positionキャッシュ（毎フレームのstyle recalc回避） ==== */
-const _posCache = new WeakMap();
-let _posCacheGen = 0;
-function getCachedPosition(el) {
-  const cached = _posCache.get(el);
-  if (cached && cached.gen === _posCacheGen) return cached.pos;
-  const pos = getComputedStyle(el).position;
-  _posCache.set(el, { pos, gen: _posCacheGen });
-  return pos;
-}
-
-/* ==== Per-frame collection pools (GC圧力削減) ==== */
-let _ptsFlat = new Float64Array(1024);  // flat [x0,y0,x1,y1,...] — 512点分で十分
-let _ptsLen = 0;
-const _textHits = [];   // reuse each frame
-const _elemHits = [];
-const _triedEls = new Set();
-const _byNode = new Map();
-
-/* textHit / elemHit オブジェクトプール（毎フレームnew回避） */
-const _textHitPool = [];
-let _textHitIdx = 0;
-function _acquireTextHit(tn, offset, cpLen, rc, pe) {
-  if (_textHitIdx < _textHitPool.length) {
-    const h = _textHitPool[_textHitIdx];
-    h.tn = tn; h.offset = offset; h.cpLen = cpLen; h.rc = rc; h.pe = pe;
-    _textHitIdx++;
-    return h;
-  }
-  const h = { tn, offset, cpLen, rc, pe };
-  _textHitPool.push(h);
-  _textHitIdx++;
-  return h;
-}
-const _elemHitPool = [];
-let _elemHitIdx = 0;
-function _acquireElemHit(type, el, r, bgImg) {
-  if (_elemHitIdx < _elemHitPool.length) {
-    const h = _elemHitPool[_elemHitIdx];
-    h.type = type; h.el = el; h.r = r; h.bgImg = bgImg;
-    _elemHitIdx++;
-    return h;
-  }
-  const h = { type, el, r, bgImg };
-  _elemHitPool.push(h);
-  _elemHitIdx++;
-  return h;
-}
-
-/* ==== P4: CSS containment for particles ==== */
-const _bhStyle = document.createElement('style');
-_bhStyle.textContent = `.bh-particle{contain:layout style paint;}`;
-(document.head || document.documentElement).appendChild(_bhStyle);
-
 /* ==== メッセージ ==== */
 chrome.runtime.onMessage.addListener((m) => {
   if (m.action === 'toggle') {
@@ -169,7 +125,6 @@ chrome.runtime.onMessage.addListener((m) => {
 });
 
 /* ==== SPA + YouTube サムネ復活防止 ==== */
-let _suppressMutationHandler = false;
 const spaObs = new MutationObserver((mutations) => {
   if (_suppressMutationHandler) return;
   if (on && ctr && !document.body.contains(ctr)) mkBH();
@@ -189,10 +144,9 @@ const spaObs = new MutationObserver((mutations) => {
       }
       // YouTube: 新しく挿入されたIMGがマウス付近にあれば即吸収
       if ((node.tagName === 'IMG' || node.tagName === 'VIDEO') && node.getAttribute('data-bh') !== '1') {
-        if (isElementProtected(node)) continue;
         const nr = node.getBoundingClientRect();
         if (nr.width > 2 && nr.height > 2) {
-          const dist = Math.hypot(bhx - (nr.left + nr.width / 2), bhy - (nr.top + nr.height / 2));
+          const dist = Math.hypot(mx - (nr.left + nr.width / 2), my - (nr.top + nr.height / 2));
           if (dist < sz + 50) {
             if (node.tagName === 'IMG') {
               const bs = tileImg(node);
@@ -217,17 +171,13 @@ function activate() {
   sz = BH_INITIAL; ambCnt = 0; samplePhase = 0;
   bodies.length = 0; lastTs = 0; totalAbsorbed = 0;
   prevMx = mx; prevMy = my;
-  bhx = mx; bhy = my; bhvx = 0; bhvy = 0;
-  tailX = mx; tailY = my;
 
   mkBH();
-  scanAndMarkProtected();  // こすくま保護: Ctrl+F方式スキャン
   document.addEventListener('mousemove', onM);
   document.addEventListener('contextmenu', onRC);
   // YouTube等のhoverトリガーを無効化
   for (const ev of HOVER_EVENTS) document.addEventListener(ev, blockHover, true);
   raf = requestAnimationFrame(loop);
-  startAmb();
   requestAnimationFrame(() => { toggling = false; });
 }
 
@@ -238,7 +188,6 @@ function off() {
 
   // ループ・入力を即停止
   if (raf) { cancelAnimationFrame(raf); raf = null; }
-  ambId = null; // rAFベースなのでclearInterval不要
   document.removeEventListener('contextmenu', onRC);
   for (const ev of HOVER_EVENTS) document.removeEventListener(ev, blockHover, true);
 
@@ -256,7 +205,7 @@ function off() {
 
   // ---- 復元対象を収集 ----
   const restoreJobs = [];
-  const bhX = bhx, bhY = bhy;
+  const bhX = mx, bhY = my;
 
   // 消したテキスト
   const erased = document.querySelectorAll('[data-bh-erased]');
@@ -318,49 +267,37 @@ function off() {
   }
 
   let completed = 0;
-  let launched = 0;
   const total = restoreJobs.length;
+  const TOTAL_LAUNCH_MS = Math.min(1200, total * 3);  // 大量の場合は短縮
+  const STAGGER = Math.max(1, Math.min(20, TOTAL_LAUNCH_MS / total));
   const startSz = sz;
-  // 10秒以内に全復元完了するように動的計算
-  const MAX_RESTORE_MS = 10000;
-  const AVAILABLE_FRAMES = (MAX_RESTORE_MS / 16.67) * 0.7; // 60fps基準、余裕30%
-  const BATCH = Math.max(4, Math.ceil(total / AVAILABLE_FRAMES));
-  const MAX_CONCURRENT_RESTORE = Math.max(60, Math.ceil(total / 20));
-  let activeRestoreCount = 0;
 
-  document.removeEventListener('mousemove', onM);
+  restoreJobs.forEach((job, i) => {
+    const tid = setTimeout(() => {
+      tids.delete(tid);
 
-  function restoreTick() {
-    if (launched >= total) return;
-    const budget = Math.min(BATCH, MAX_CONCURRENT_RESTORE - activeRestoreCount);
-    if (budget <= 0) {
-      requestAnimationFrame(restoreTick);
-      return;
-    }
-    const end = Math.min(launched + budget, total);
-    for (let i = launched; i < end; i++) {
+      // BHが縮む（吐き出すほど小さくなる）
       const progress = (i + 1) / total;
       const newSz = Math.max(BH_INITIAL, startSz * (1 - progress * 0.9));
       if (ctr) {
         ctr.style.setProperty('--bh-size', newSz + 'px');
-        if (i % 10 === 0 && ctr) {
-          ctr.animate([
-            { transform: `translate(${bhX}px,${bhY}px) scale(1.08)` },
-            { transform: `translate(${bhX}px,${bhY}px) scale(1)` }
-          ], { duration: 200, easing: 'ease-out' });
+        // 吐き出し時に微振動
+        if (i % 5 === 0) {
+          ctr.classList.remove('bh-gulp');
+          void ctr.offsetHeight;
+          ctr.classList.add('bh-gulp');
         }
       }
-      activeRestoreCount++;
-      launchRestore(restoreJobs[i], bhX, bhY, total, () => {
-        activeRestoreCount--;
+
+      launchRestore(job, bhX, bhY, total, () => {
         completed++;
         if (completed >= total) finishOff();
       });
-    }
-    launched = end;
-    if (launched < total) requestAnimationFrame(restoreTick);
-  }
-  requestAnimationFrame(restoreTick);
+    }, i * STAGGER);
+    tids.add(tid);
+  });
+
+  document.removeEventListener('mousemove', onM);
 }
 
 /* ---- 1つの復元パーティクルを射出 ---- */
@@ -375,14 +312,14 @@ function launchRestore(job, bhX, bhY, total, onDone) {
       `font-size:${job.fontSize};font-family:${job.fontFamily};` +
       `font-weight:${job.fontWeight};color:${job.color};` +
       `line-height:1;margin:0;padding:0;background:none;` +
-      `pointer-events:none;z-index:2147483645;border-radius:0;` +
+      `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;` +
       `transform:scale(0);opacity:0;`;
   } else {
     p.textContent = '';
     p.style.cssText =
       `position:fixed;left:${bhX}px;top:${bhY}px;width:8px;height:8px;` +
       `background:#888;border-radius:50%;` +
-      `pointer-events:none;z-index:2147483645;` +
+      `pointer-events:none;z-index:2147483645;will-change:transform;` +
       `transform:scale(0);opacity:0;`;
   }
   document.body.appendChild(p);
@@ -399,9 +336,7 @@ function launchRestore(job, bhX, bhY, total, onDone) {
   const midY = dy * 0.5 + perpY * curve;
   const rotDir = (Math.random() - 0.5) * 720;
 
-  // 10秒以内に完了するよう、総数に応じてdurationを動的調整
-  const baseDur = Math.max(120, Math.min(600, 8000 / Math.max(total, 1) * 20));
-  const dur = baseDur + Math.random() * (baseDur * 0.4);
+  const dur = total > 200 ? 300 + Math.random() * 200 : 600 + Math.random() * 400;
 
   const anim = p.animate([
     { transform: 'scale(0) rotate(0deg)', opacity: 0 },
@@ -457,8 +392,6 @@ function finishOff() {
   for (const el of befores) el.removeAttribute('data-bh-before');
   const afters = document.querySelectorAll('[data-bh-after]');
   for (const el of afters) el.removeAttribute('data-bh-after');
-  const protMarks = document.querySelectorAll('[data-bh-protected]');
-  for (const el of protMarks) el.removeAttribute('data-bh-protected');
 
   for (const t of tids) clearTimeout(t);
   tids.clear();
@@ -466,7 +399,7 @@ function finishOff() {
   // BHフェードアウト
   if (ctr) {
     ctr.classList.add('bh-fadeout');
-    const fin = () => { if (ctr) { ctr.remove(); ctr = null; tailEl = null; } toggling = false; };
+    const fin = () => { if (ctr) { ctr.remove(); ctr = null; } toggling = false; };
     const fb = setTimeout(() => { fin(); }, 700);
     tids.add(fb);
     ctr.addEventListener('animationend', () => { clearTimeout(fb); tids.delete(fb); fin(); }, { once: true });
@@ -484,17 +417,11 @@ function mkBH() {
   if (ctr && document.body.contains(ctr)) return;
   ctr = document.createElement('div');
   ctr.id = 'bh-container';
-  tailEl = document.createElement('div');
-  tailEl.className = 'bh-tail';
-  ctr.appendChild(tailEl);
   const c = document.createElement('div');
   c.className = 'bh-core';
   ctr.appendChild(c);
   document.body.appendChild(ctr);
-  /* バネ初期位置をマウス位置に合わせる */
-  bhx = mx; bhy = my; bhvx = 0; bhvy = 0;
-  tailX = mx; tailY = my;
-  updSz(); updPos(0);
+  updSz(); updPos();
 }
 
 function onM(e) { mx = e.clientX; my = e.clientY; }
@@ -508,47 +435,13 @@ function blockHover(e) {
 }
 const HOVER_EVENTS = ['mouseenter', 'mouseover', 'mouseleave', 'mouseout', 'pointerenter', 'pointerover', 'pointerleave', 'pointerout'];
 
-function updPos(dt) {
+function updPos() {
   if (!ctr) return;
-
-  /* バネ物理: F = -k*(pos-target) - damp*vel */
-  if (dt > 0) {
-    const fx = -SPRING_K * (bhx - mx) - SPRING_DAMP * bhvx;
-    const fy = -SPRING_K * (bhy - my) - SPRING_DAMP * bhvy;
-    bhvx += fx * dt;
-    bhvy += fy * dt;
-    bhx += bhvx * dt;
-    bhy += bhvy * dt;
-
-    /* テール: BH位置をさらに遅れて追従 */
-    tailX += (bhx - tailX) * TAIL_LAG;
-    tailY += (bhy - tailY) * TAIL_LAG;
-  }
-
-  const rx = Math.round(bhx * 10) / 10;
-  const ry = Math.round(bhy * 10) / 10;
-  if (rx === lastPosMx && ry === lastPosMy) return;
-  lastPosMx = rx; lastPosMy = ry;
-  ctr.style.setProperty('--bh-x', rx + 'px');
-  ctr.style.setProperty('--bh-y', ry + 'px');
-  ctr.style.transform = `translate(${rx}px,${ry}px)`;
-
-  /* テール描画 — BHからのオフセットで配置 + 速度に応じて伸びる */
-  if (tailEl) {
-    const dx = tailX - bhx, dy = tailY - bhy;
-    const speed = Math.hypot(bhvx, bhvy);
-    const stretch = Math.min(2.5, 1 + speed / 400);
-    const tailOp = Math.min(0.6, speed / 600);
-    if (tailOp > 0.02) {
-      const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-      tailEl.style.transform =
-        `translate(calc(-50% + ${dx * 0.5}px), calc(-50% + ${dy * 0.5}px)) ` +
-        `rotate(${angle}deg) scaleX(${stretch})`;
-      tailEl.style.opacity = tailOp;
-    } else {
-      tailEl.style.opacity = '0';
-    }
-  }
+  if (mx === lastPosMx && my === lastPosMy) return;
+  lastPosMx = mx; lastPosMy = my;
+  ctr.style.setProperty('--bh-x', mx + 'px');
+  ctr.style.setProperty('--bh-y', my + 'px');
+  ctr.style.transform = `translate(${mx}px,${my}px)`;
 }
 
 function updSz() {
@@ -560,170 +453,69 @@ function updSz() {
    モード — フィルタリング関数
    ================================================================ */
 
-/** textContent に保護ワードを含むか */
-function _containsKosukuma(text) {
-  if (!text) return false;
-  _KOSUKUMA_RE.lastIndex = 0;
-  return _KOSUKUMA_RE.test(text);
-}
-
-/** テキストノードの保護範囲を計算してWeakMapに格納 */
-function _computeRanges(textNode) {
-  const text = textNode.textContent;
-  if (!text) return;
-  _KOSUKUMA_RE.lastIndex = 0;
-  const ranges = [];
-  let m;
-  while ((m = _KOSUKUMA_RE.exec(text)) !== null) {
-    ranges.push([m.index, m.index + m[0].length]);
-  }
-  if (ranges.length > 0) _protectedRanges.set(textNode, ranges);
-}
-
-/** 分割テキスト対応: 祖先要素内のテキストノードを結合して保護範囲を計算 */
-function _computeSplitRanges(ancestorEl) {
-  const walker = document.createTreeWalker(ancestorEl, NodeFilter.SHOW_TEXT, null);
-  let n, fullText = '';
-  const nodes = [];
-  while ((n = walker.nextNode())) {
-    nodes.push({ node: n, start: fullText.length });
-    fullText += n.textContent;
-  }
-  if (!fullText) return;
-  _KOSUKUMA_RE.lastIndex = 0;
-  let m;
-  const matches = [];
-  while ((m = _KOSUKUMA_RE.exec(fullText)) !== null) {
-    matches.push([m.index, m.index + m[0].length]);
-  }
-  if (matches.length === 0) return;
-  for (const { node, start } of nodes) {
-    const nodeEnd = start + node.textContent.length;
-    const ranges = [];
-    for (const [mStart, mEnd] of matches) {
-      if (mStart < nodeEnd && mEnd > start) {
-        const localStart = Math.max(0, mStart - start);
-        const localEnd = Math.min(node.textContent.length, mEnd - start);
-        ranges.push([localStart, localEnd]);
-      }
-    }
-    if (ranges.length > 0) {
-      const existing = _protectedRanges.get(node) || [];
-      _protectedRanges.set(node, existing.concat(ranges));
-    }
-  }
-}
-
-/** ページ全体をスキャンして保護情報を事前計算 */
-function scanAndMarkProtected() {
-  if (!document.body) return;
-  let markCount = 0;
-
-  // Step 1: テキストノード走査 — 直接マッチの範囲計算
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-  let node;
-  while ((node = walker.nextNode())) {
-    const text = node.textContent;
-    if (_containsKosukuma(text)) {
-      _computeRanges(node);
-      if (node.parentElement) node.parentElement.setAttribute('data-bh-protected', '1');
-      markCount++;
-      continue;
-    }
-    if (text && text.length <= 20) {
-      let el = node.parentElement;
-      for (let i = 0; i < 10 && el; i++) {
-        if (el.hasAttribute('data-bh-protected')) break;
-        const tc = el.textContent;
-        if (tc && tc.length <= 200 && _containsKosukuma(tc)) {
-          el.setAttribute('data-bh-protected', '1');
-          _computeSplitRanges(el);
-          markCount++;
-          break;
-        }
-        el = el.parentElement;
-      }
-    }
-  }
-
-  // Step 2: 属性チェック → 要素レベル保護
-  const attrSels = '[data-name],[title],[alt],[aria-label],[email]';
-  try {
-    for (const el of document.querySelectorAll(attrSels)) {
-      for (const attr of ['data-name', 'title', 'alt', 'aria-label', 'email']) {
-        if (_containsKosukuma(el.getAttribute(attr))) {
-          el.setAttribute('data-bh-protected', '1');
-          _protectedElements.add(el);
-          markCount++;
-          break;
-        }
-      }
-    }
-  } catch {}
-  if (markCount > 0) console.log(`[BH] こすくま保護: ${markCount}箇所`);
-}
-
-/** テキスト文字が保護対象か — WeakMapルックアップ + フォールバック */
+/** こすくま保護: 指定オフセットの文字が保護ワードの一部か判定 */
 function isProtectedChar(tn, offset) {
-  let ranges = _protectedRanges.get(tn);
-  if (!ranges) {
-    const text = tn.textContent;
-    if (!text) return false;
-    if (_containsKosukuma(text)) {
-      _computeRanges(tn);
-      ranges = _protectedRanges.get(tn);
-    } else {
-      let el = tn.parentElement;
-      for (let i = 0; i < 10 && el; i++) {
-        if (el.hasAttribute && el.hasAttribute('data-bh-protected')) {
-          _computeSplitRanges(el);
-          ranges = _protectedRanges.get(tn);
-          break;
-        }
-        el = el.parentElement;
+  // テキストノード自体と親・祖父要素のテキストを探索
+  const sources = [tn.textContent];
+  const p = tn.parentElement;
+  if (p) {
+    const pt = p.textContent;
+    if (pt.length < 500) sources.push(pt);
+    const gp = p.parentElement;
+    if (gp) {
+      const gt = gp.textContent;
+      if (gt.length < 500) sources.push(gt);
+    }
+  }
+
+  // テキストノード内でのオフセットを使って判定
+  const text = tn.textContent;
+  let match;
+  const re = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
+  while ((match = re.exec(text)) !== null) {
+    if (offset >= match.index && offset < match.index + match[0].length) return true;
+  }
+
+  // 親・祖父要素内で分割されたケース: テキストノードの前後のテキストを結合して判定
+  if (p) {
+    let accumulated = 0;
+    const walker = document.createTreeWalker(p, NodeFilter.SHOW_TEXT, null);
+    let n;
+    let fullText = '';
+    let globalOffset = -1;
+    while ((n = walker.nextNode())) {
+      if (n === tn) globalOffset = fullText.length + offset;
+      fullText += n.textContent;
+    }
+    if (globalOffset >= 0 && fullText.length < 500) {
+      const re2 = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
+      while ((match = re2.exec(fullText)) !== null) {
+        if (globalOffset >= match.index && globalOffset < match.index + match[0].length) return true;
       }
     }
-    if (!ranges) return false;
   }
-  for (let i = 0; i < ranges.length; i++) {
-    if (offset >= ranges[i][0] && offset < ranges[i][1]) return true;
-  }
+
   return false;
 }
-
-/** ノードが保護対象か（祖先チェック — 要素吸収用） */
-function isProtected(node) {
-  let el = node && node.nodeType === 3 ? node.parentElement : node;
-  while (el) {
-    if (el.hasAttribute && el.hasAttribute('data-bh-protected')) return true;
-    el = el.parentElement;
-  }
-  return false;
-}
-
-/** 要素が保護対象か（画像・動画用） */
-const isElementProtected = (el) => _protectedElements.has(el) || isProtected(el);
 
 /* ================================================================
    メインループ
    ================================================================ */
-let skipPeel = false;
-
 function loop(ts) {
   if (!on) return;
   const dt = lastTs ? Math.min((ts - lastTs) / 1000, 0.05) : 0.016;
   lastTs = ts;
-  const frameStart = performance.now();
 
-  // フレーム全体でMutationObserverを抑制（physicsAndAbsorb/spawnAmbのstyle書き込みも含む）
+  // フレーム全体でMutationObserverを抑制
   _suppressMutationHandler = true;
 
-  updPos(dt);
+  updPos();
   if (szDirty) { updSz(); szDirty = false; }
 
-  const moved = Math.hypot(mx - prevMx, my - prevMy) > 2;
-  if (!skipPeel || moved) peel();
+  _posCacheGen++;
+  _bgCacheGen++;
 
+  peel();
   physicsAndAbsorb(dt);
   trySpawnAmb(ts);
   maybeNormalize(ts);
@@ -731,9 +523,6 @@ function loop(ts) {
   // フレーム終了: 溜まったmutationを破棄してからobserver再開
   spaObs.takeRecords();
   _suppressMutationHandler = false;
-
-  const elapsed = performance.now() - frameStart;
-  skipPeel = elapsed > 12 && bodies.length > 200;
 
   raf = requestAnimationFrame(loop);
 }
@@ -752,14 +541,15 @@ function peel() {
   const pressure = bodies.length / MAX_BODIES;
   const rate = pressure > 0.7 ? Math.max(3, Math.floor(baseRate * (1 - pressure))) : baseRate;
   const touchR = sz / 2 + 3;
+  const vw = window.innerWidth, vh = window.innerHeight;
 
-  /* サンプル数はv1.1.0と同じ（軽量） */
   const nAngles = Math.min(16, 4 + Math.floor(sz / 20));
   const nRings  = Math.min(5, 2 + Math.floor(sz / 60));
 
-  /* pts flat array: [x0,y0,x1,y1,...] — GCゼロ */
   _ptsLen = 0;
   function pushPt(x, y) {
+    // Viewport clipping
+    if (x < -10 || x > vw + 10 || y < -10 || y > vh + 10) return;
     if (_ptsLen + 2 > _ptsFlat.length) {
       const next = new Float64Array(_ptsFlat.length * 2);
       next.set(_ptsFlat);
@@ -768,20 +558,17 @@ function peel() {
     _ptsFlat[_ptsLen++] = x;
     _ptsFlat[_ptsLen++] = y;
   }
-  /* BHの描画位置（バネ出力）を吸い込み中心とする */
-  const cx0 = bhx, cy0 = bhy;
-  pushPt(cx0, cy0);
+  pushPt(mx, my);
 
-  /* 高速移動対策: 前フレーム→現在フレームの移動パスに沿ってサンプリング */
-  const moveDist = Math.hypot(cx0 - prevMx, cy0 - prevMy);
+  // High speed interpolation
+  const moveDist = Math.hypot(mx - prevMx, my - prevMy);
   if (moveDist > touchR * 0.5) {
     const steps = Math.min(8, Math.ceil(moveDist / (touchR * 0.5)));
     for (let s = 1; s < steps; s++) {
       const t = s / steps;
-      const ix = prevMx + (cx0 - prevMx) * t;
-      const iy = prevMy + (cy0 - prevMy) * t;
+      const ix = prevMx + (mx - prevMx) * t;
+      const iy = prevMy + (my - prevMy) * t;
       pushPt(ix, iy);
-      /* 移動パスの各点にも少し周囲サンプル */
       for (let a = 0; a < 4; a++) {
         const ang = (a / 4) * Math.PI * 2;
         pushPt(ix + Math.cos(ang) * touchR * 0.5, iy + Math.sin(ang) * touchR * 0.5);
@@ -789,76 +576,68 @@ function peel() {
     }
   }
 
-  /* 現在位置の周囲サンプリング
-   * BH内部（不透明）にサンプルしても何も検出できないので、
-   * 視覚端(35%)〜外縁(100%)の範囲でのみ検出する */
+  // Interleaved angle scanning: half per frame
   const innerFrac = 0.35;
-  /* インターリーブ: 全角度の1/2だけスキャン、2フレームでフルカバレッジ */
   for (let i = samplePhase % 2; i < nAngles; i += 2) {
     const a = ((samplePhase + i) % (nAngles * 2));
     const ang = (a / (nAngles * 2)) * Math.PI * 2;
     for (let r = 1; r <= nRings; r++) {
       const frac = innerFrac + (r / (nRings + 1)) * (1 - innerFrac);
-      pushPt(cx0 + Math.cos(ang) * touchR * frac, cy0 + Math.sin(ang) * touchR * frac);
+      pushPt(mx + Math.cos(ang) * touchR * frac, my + Math.sin(ang) * touchR * frac);
     }
   }
   samplePhase++;
 
-  prevMx = cx0; prevMy = cy0;
+  prevMx = mx; prevMy = my;
 
-  /* ========== Phase 1: Read-only — collect hits without DOM mutation ========== */
-  _textHits.length = 0;
-  _elemHits.length = 0;
   _triedEls.clear();
-  _textHitIdx = 0;
-  _elemHitIdx = 0;
-  _posCacheGen++; // positionキャッシュ世代更新
+  _posCacheGen++;
   let n = 0;
   let caretCalls = 0;
-  const MAX_CARET_PER_FRAME = 12; // caretRangeFromPoint は同期レイアウト強制 — フレーム上限
+  let elemCalls = 0;
+  const MAX_CARET_PER_FRAME = 12;
+  const MAX_ELEM_PER_FRAME = 16;
 
   for (let pi = 0; pi < _ptsLen; pi += 2) {
     if (n >= rate) break;
     const px = _ptsFlat[pi], py = _ptsFlat[pi + 1];
 
-    // ① テキスト文字を検出（read-only: caretRangeFromPoint + charRect）
-    let range = null;
+    // ① テキスト文字を検出
     if (caretCalls < MAX_CARET_PER_FRAME) {
-      range = document.caretRangeFromPoint(px, py);
+      const range = document.caretRangeFromPoint(px, py);
       caretCalls++;
-    }
-    if (range && range.startContainer.nodeType === 3) {
-      const tn = range.startContainer;
-      const offset = range.startOffset;
-
-      // 既に消した文字のspan内ならスキップ
-      if (tn.parentElement && tn.parentElement.hasAttribute('data-bh-erased')) continue;
-
-      if (offset < tn.textContent.length) {
-        const cpLen = cpLength(tn.textContent, offset);
-        const ch = tn.textContent.slice(offset, offset + cpLen);
-        if (ch && ch !== '\n' && ch !== '\r' && ch !== '\t' && ch.trim()) {
-          // こすくま保護: この文字がこすくまワードの一部ならスキップ
-          if (isProtectedChar(tn, offset)) continue;
-
-          const rc = charRect(tn, offset, cpLen);
-          if (rc && rc.width > 0.3 && rc.height > 0.3) {
-            const pe = tn.parentElement;
-            if (pe && sz < PHASE_FIXED) {
-              const pos = getCachedPosition(pe);
-              if (pos === 'fixed' || pos === 'sticky') continue;
+      if (range && range.startContainer.nodeType === 3) {
+        const tn = range.startContainer;
+        const offset = range.startOffset;
+        if (tn.parentElement && tn.parentElement.hasAttribute('data-bh-erased')) continue;
+        if (offset < tn.textContent.length) {
+          const cpLen = cpLength(tn.textContent, offset);
+          const ch = tn.textContent.slice(offset, offset + cpLen);
+          if (ch && ch !== '\n' && ch !== '\r' && ch !== '\t' && ch.trim()) {
+            if (isProtectedChar(tn, offset)) continue;
+            const rc = charRect(tn, offset, cpLen);
+            if (rc && rc.width > 0.3 && rc.height > 0.3) {
+              const pe = tn.parentElement;
+              if (pe && sz < PHASE_FIXED) {
+                const pos = getCachedPosition(pe);
+                if (pos === 'fixed' || pos === 'sticky') continue;
+              }
+              const span = eraseChar(tn, offset, cpLen);
+              if (span) {
+                mkCharBody(span, rc, pe);
+                n++;
+              }
+              continue;
             }
-
-            _textHits.push(_acquireTextHit(tn, offset, cpLen, rc, pe));
-            n++;
-            continue;
           }
         }
       }
     }
 
-    // ② 非テキスト要素を検出（read-only: elementFromPoint + checks）
+    // ② 非テキスト要素を検出
+    if (elemCalls >= MAX_ELEM_PER_FRAME) continue;
     const el = document.elementFromPoint(px, py);
+    elemCalls++;
     if (!el || _triedEls.has(el)) continue;
     _triedEls.add(el);
     if (SKIP.has(el.tagName)) continue;
@@ -874,45 +653,45 @@ function peel() {
     }
 
     if (hasVisibleText(el)) {
-      _elemHits.push(_acquireElemHit('pseudo', el, null, null));
+      peelPseudo(el);
       continue;
     }
 
     if (el.tagName === 'IMG' || el.tagName === 'PICTURE') {
       const img = el.tagName === 'PICTURE' ? el.querySelector('img') : el;
       if (img) {
-        if (isElementProtected(img)) continue;
-        _elemHits.push(_acquireElemHit('img', img, null, null));
-        n++;
+        const bs = tileImg(img);
+        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+        n += bs.length;
       }
       continue;
     }
 
     if (el.tagName === 'VIDEO') {
-      if (isElementProtected(el)) continue;
-      _elemHits.push(_acquireElemHit('video', el, null, null));
-      n++;
+      const bs = tileVideo(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
       continue;
     }
 
     if (el.tagName === 'CANVAS') {
-      if (isElementProtected(el)) continue;
-      _elemHits.push(_acquireElemHit('canvas', el, null, null));
-      n++;
+      const bs = tileCanvas(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
       continue;
     }
 
     if (el.tagName === 'svg' || el.tagName === 'SVG' || el instanceof SVGElement) {
-      if (isElementProtected(el)) continue;
-      _elemHits.push(_acquireElemHit('svg', el, null, null));
-      n++;
+      const bs = tileSVG(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
       continue;
     }
 
     if (el.tagName === 'IFRAME') {
-      if (isElementProtected(el)) continue;
-      _elemHits.push(_acquireElemHit('iframe', el, null, null));
-      n++;
+      const bs = tileIframe(el);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
       continue;
     }
 
@@ -920,96 +699,31 @@ function peel() {
     if (r.width < 2 || r.height < 2) continue;
 
     if (el.shadowRoot) {
-      _elemHits.push(_acquireElemHit('shadow', el, null, null));
+      peelShadow(el.shadowRoot);
     }
 
-    const bgImg = getComputedStyle(el).backgroundImage;
+    const bgImg = getCachedBgImage(el);
     if (bgImg && bgImg !== 'none' && !hasVisibleText(el)) {
-      if (isElementProtected(el)) continue;
-      _elemHits.push(_acquireElemHit('bgImage', el, r, bgImg));
-      n++;
+      const bs = tileBgImage(el, r, bgImg);
+      for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
+      n += bs.length;
       continue;
     }
 
     if (r.width * r.height > 40000 && el.children.length > 5) continue;
 
-    if (isElementProtected(el)) continue;
-
     if (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') {
       if (!hasVisibleText(el) || el.tagName === 'INPUT') {
-        _elemHits.push(_acquireElemHit('absorb', el, r, null));
+        absorbEl(el, r);
         n++;
         continue;
       }
     }
 
-    _elemHits.push(_acquireElemHit('absorbPseudo', el, r, null));
+    peelPseudo(el);
+    absorbEl(el, r);
     n++;
   }
-
-  /* ========== Phase 2: Write — DOM mutations ========== */
-  // (MutationObserverはloop()がフレーム全体で抑制中)
-
-  // Text hits: group by text node, sort offsets descending, process 1 per node
-  _byNode.clear();
-  for (const hit of _textHits) {
-    if (!_byNode.has(hit.tn)) _byNode.set(hit.tn, hit);
-    else if (hit.offset > _byNode.get(hit.tn).offset) _byNode.set(hit.tn, hit);
-  }
-  for (const hit of _byNode.values()) {
-    const span = eraseChar(hit.tn, hit.offset, hit.cpLen);
-    if (span) { mkCharBody(span, hit.rc, hit.pe); }
-  }
-
-  // Element hits: process in order
-  for (const hit of _elemHits) {
-    switch (hit.type) {
-      case 'pseudo':
-        peelPseudo(hit.el);
-        break;
-      case 'img': {
-        const bs = tileImg(hit.el);
-        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-        break;
-      }
-      case 'video': {
-        const bs = tileVideo(hit.el);
-        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-        break;
-      }
-      case 'canvas': {
-        const bs = tileCanvas(hit.el);
-        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-        break;
-      }
-      case 'svg': {
-        const bs = tileSVG(hit.el);
-        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-        break;
-      }
-      case 'iframe': {
-        const bs = tileIframe(hit.el);
-        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-        break;
-      }
-      case 'shadow':
-        peelShadow(hit.el.shadowRoot);
-        break;
-      case 'bgImage': {
-        const bs = tileBgImage(hit.el, hit.r, hit.bgImg);
-        for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
-        break;
-      }
-      case 'absorb':
-        absorbEl(hit.el, hit.r);
-        break;
-      case 'absorbPseudo':
-        peelPseudo(hit.el);
-        absorbEl(hit.el, hit.r);
-        break;
-    }
-  }
-
 }
 
 /* ---- リストマーカー・疑似要素のパーティクル化 ---- */
@@ -1088,11 +802,11 @@ function mkPseudoBody(text, rc, st) {
     `font-size:${st.fontSize || '16px'};font-family:${st.fontFamily || 'inherit'};` +
     `font-weight:${st.fontWeight || 'normal'};color:${st.color || '#000'};` +
     `line-height:1;margin:0;padding:0;background:none;` +
-    `pointer-events:none;z-index:2147483645;border-radius:0;`;
+    `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
   document.body.appendChild(p);
 
   const cx = rc.left + rc.width / 2, cy = rc.top + rc.height / 2;
-  const dx = bhx - cx, dy = bhy - cy;
+  const dx = mx - cx, dy = my - cy;
   const d = Math.hypot(dx, dy) || 1;
 
   bodies.push({
@@ -1122,8 +836,6 @@ function eraseChar(tn, offset, cpLen) {
     frag.appendChild(span);
     if (after) frag.appendChild(document.createTextNode(after));
     parent.replaceChild(frag, tn);
-
-    // DOM断片化トラッキング: 親をdirtyとして記録 → 定期normalize()で結合
     _dirtyParents.add(parent);
 
     return span;
@@ -1142,11 +854,11 @@ function mkCharBody(span, rc, parentEl) {
     `font-size:${st ? st.fontSize : '16px'};font-family:${st ? st.fontFamily : 'inherit'};` +
     `font-weight:${st ? st.fontWeight : 'normal'};color:${st ? st.color : '#000'};` +
     `line-height:1;margin:0;padding:0;background:none;` +
-    `pointer-events:none;z-index:2147483645;border-radius:0;`;
+    `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
   document.body.appendChild(p);
 
   const cx = rc.left + rc.width / 2, cy = rc.top + rc.height / 2;
-  const dx = bhx - cx, dy = bhy - cy;
+  const dx = mx - cx, dy = my - cy;
   const d = Math.hypot(dx, dy) || 1;
 
   bodies.push({
@@ -1157,7 +869,6 @@ function mkCharBody(span, rc, parentEl) {
 
 /* ---- 要素の単体吸収 ---- */
 function absorbEl(el, r) {
-  if (isElementProtected(el)) return;
   el.setAttribute('data-bh', '1');
   el.style.visibility = 'hidden';
   el.style.pointerEvents = 'none';
@@ -1169,11 +880,11 @@ function absorbEl(el, r) {
     `position:fixed;left:${r.left}px;top:${r.top}px;` +
     `width:${r.width}px;height:${r.height}px;` +
     `margin:0;pointer-events:none;overflow:hidden;` +
-    `z-index:2147483645;`;
+    `z-index:2147483645;will-change:transform;`;
   document.body.appendChild(clone);
 
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-  const dx = bhx - cx, dy = bhy - cy;
+  const dx = mx - cx, dy = my - cy;
   const d = Math.hypot(dx, dy) || 1;
 
   bodies.push({
@@ -1204,14 +915,14 @@ function tileImg(img) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
       d.style.backgroundImage = `url("${src.replace(/["\\()]/g, '\\$&')}")`;
       d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
       d.style.backgroundSize = `${r.width}px ${r.height}px`;
       document.body.appendChild(d);
 
       const cx = x + w / 2, cy = y + h / 2;
-      const dx = bhx - cx, dy = bhy - cy;
+      const dx = mx - cx, dy = my - cy;
       const dist = Math.hypot(dx, dy) || 1;
 
       out.push({
@@ -1262,7 +973,7 @@ function tileVideo(video) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
       if (dataUrl) {
         d.style.backgroundImage = `url("${dataUrl}")`;
         d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
@@ -1273,7 +984,7 @@ function tileVideo(video) {
       document.body.appendChild(d);
 
       const cx = x + w / 2, cy = y + h / 2;
-      const dx = bhx - cx, dy = bhy - cy;
+      const dx = mx - cx, dy = my - cy;
       const dist = Math.hypot(dx, dy) || 1;
 
       out.push({
@@ -1328,7 +1039,7 @@ function tileCanvas(canvas) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
       if (dataUrl) {
         d.style.backgroundImage = `url("${dataUrl}")`;
         d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
@@ -1339,7 +1050,7 @@ function tileCanvas(canvas) {
       document.body.appendChild(d);
 
       const cx = x + w / 2, cy = y + h / 2;
-      const dx = bhx - cx, dy = bhy - cy;
+      const dx = mx - cx, dy = my - cy;
       const dist = Math.hypot(dx, dy) || 1;
 
       out.push({
@@ -1437,13 +1148,13 @@ function tileBgImage(el, r, bgImg) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;border-radius:0;` +
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;` +
         `background:${bgImg};background-size:${r.width}px ${r.height}px;` +
         `background-position:-${col * tw}px -${row * th}px;`;
       document.body.appendChild(d);
 
       const cx = x + w / 2, cy = y + h / 2;
-      const dx = bhx - cx, dy = bhy - cy;
+      const dx = mx - cx, dy = my - cy;
       const dist = Math.hypot(dx, dy) || 1;
       out.push({
         el: d, x: cx, y: cy, ox: cx, oy: cy,
@@ -1470,15 +1181,14 @@ function peelShadow(root) {
       const cpLen = cpLength(text, i);
       const ch = text.slice(i, i + cpLen);
       if (!ch.trim()) continue;
-      // こすくま保護: WeakMapになければオンデマンド計算
-      if (!_protectedRanges.has(node) && _containsKosukuma(text)) _computeRanges(node);
+      // こすくま保護: この文字が保護ワードの一部ならスキップ
       if (isProtectedChar(node, i)) continue;
       const rc = charRect(node, i, cpLen);
       if (!rc || rc.width < 0.3 || rc.height < 0.3) continue;
       const span = eraseChar(node, i, cpLen);
       if (span) {
         mkCharBody(span, rc, parent);
-        return; // eraseCharがDOMを変更するのでTreeWalkerが無効 — 次フレームで再入
+        break; // TreeWalkerが無効になるので1文字ずつ
       }
     }
   }
@@ -1488,23 +1198,18 @@ function peelShadow(root) {
   for (const el of els) {
     if (el.getAttribute('data-bh') === '1') continue;
     if (el.tagName === 'IMG') {
-      if (isElementProtected(el)) continue;
       const bs = tileImg(el);
       for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
     } else if (el.tagName === 'VIDEO') {
-      if (isElementProtected(el)) continue;
       const bs = tileVideo(el);
       for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
     } else if (el.tagName === 'CANVAS') {
-      if (isElementProtected(el)) continue;
       const bs = tileCanvas(el);
       for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
     } else if (el.tagName === 'svg' || el.tagName === 'SVG' || el instanceof SVGElement) {
-      if (isElementProtected(el)) continue;
       const bs = tileSVG(el);
       for (const b of bs) { if (bodies.length < MAX_BODIES) bodies.push(b); }
     } else {
-      if (isElementProtected(el)) continue;
       const r = el.getBoundingClientRect();
       if (r.width > 2 && r.height > 2) absorbEl(el, r);
     }
@@ -1528,14 +1233,14 @@ function _tileWithSrc(r, src) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
       d.style.backgroundImage = `url("${src.replace(/["\\()]/g, '\\$&')}")`;
       d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
       d.style.backgroundSize = `${r.width}px ${r.height}px`;
       document.body.appendChild(d);
 
       const cx = x + w / 2, cy = y + h / 2;
-      const dx = bhx - cx, dy = bhy - cy;
+      const dx = mx - cx, dy = my - cy;
       const dist = Math.hypot(dx, dy) || 1;
       out.push({
         el: d, x: cx, y: cy, ox: cx, oy: cy,
@@ -1566,11 +1271,11 @@ function _tileFallback(el, r, color) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `background:${color};pointer-events:none;z-index:2147483645;border-radius:0;`;
+        `background:${color};pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
       document.body.appendChild(d);
 
       const cx = x + w / 2, cy = y + h / 2;
-      const dx = bhx - cx, dy = bhy - cy;
+      const dx = mx - cx, dy = my - cy;
       const dist = Math.hypot(dx, dy) || 1;
       out.push({
         el: d, x: cx, y: cy, ox: cx, oy: cy,
@@ -1587,14 +1292,13 @@ function _tileFallback(el, r, color) {
 function physicsAndAbsorb(dt) {
   const field = sz * BH_FIELD;
   const damp = Math.pow(DAMPING, dt * 60);
-  const vw = window.innerWidth, vh = window.innerHeight;
   const coreSq = (sz * 0.6) * (sz * 0.6);
   let write = 0;
 
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i];
-    const dx = bhx - b.x;
-    const dy = bhy - b.y;
+    const dx = mx - b.x;
+    const dy = my - b.y;
     const distSq = dx * dx + dy * dy;
 
     // 吸収判定（distSq再利用でsqrt不要）
@@ -1618,40 +1322,33 @@ function physicsAndAbsorb(dt) {
     b.vx *= damp;
     b.vy *= damp;
 
-    // 速度クランプ — spdSqで比較してsqrt回避
-    const spdSq = b.vx * b.vx + b.vy * b.vy;
-    const maxSpdSq = MAX_SPEED * MAX_SPEED;
-    if (spdSq > maxSpdSq) { const s = MAX_SPEED / Math.sqrt(spdSq); b.vx *= s; b.vy *= s; }
+    const spd = Math.hypot(b.vx, b.vy);
+    if (spd > MAX_SPEED) { const s = MAX_SPEED / spd; b.vx *= s; b.vy *= s; }
 
     b.x += b.vx * dt;
     b.y += b.vy * dt;
 
-    // rot — |vx|+|vy|近似でsqrt不要（回転角度に精度は不要）
-    b.rot += (Math.abs(b.vx) + Math.abs(b.vy)) * dt * 0.15;
-
-    // BHコア付近は次フレームで吸収されるのでDOM更新をスキップ
-    if (dist < sz * 0.25) { bodies[write++] = b; continue; }
-
-    // P3: Viewport culling
-    if (b.x < -100 || b.x > vw + 100 || b.y < -100 || b.y > vh + 100) { bodies[write++] = b; continue; }
+    const cSpd = Math.min(spd, MAX_SPEED);
+    b.rot += cSpd * dt * 0.3;
 
     const scaleR = sz * 1.2;
     const scale = dist < scaleR ? Math.max(0.05, dist / scaleR) : 1;
     const opacity = dist < sz ? Math.max(0.1, dist / sz) : 1;
 
-    // dirtyチェック + 整数化
-    const tx = (b.x - b.ox + 0.5) | 0;
-    const ty = (b.y - b.oy + 0.5) | 0;
+    // ダーティチェック: 整数化して前回値と比較
+    const tx = (b.x - b.ox) | 0;
+    const ty = (b.y - b.oy) | 0;
     const rot = b.rot | 0;
-    const sc = ((scale * 1000 + 0.5) | 0);
+    const sc = (scale * 1000 + 0.5) | 0;
     const op = opacity < 0.99 ? ((opacity * 100 + 0.5) | 0) : 100;
-    if (tx === b._ptx && ty === b._pty && rot === b._prot && sc === b._psc && op === b._pop) { bodies[write++] = b; continue; }
-    b._ptx = tx; b._pty = ty; b._prot = rot; b._psc = sc; b._pop = op;
 
-    // opacity込みのtransform一括書き込み — style.opacity個別変更によるレイヤー昇格/降格を回避
+    if (tx === b._ptx && ty === b._pty && rot === b._prot && sc === b._psc && op === b._pop) {
+      bodies[write++] = b;
+      continue;
+    }
+    b._ptx = tx; b._pty = ty; b._prot = rot; b._psc = sc; b._pop = op;
     b.el.style.transform = 'translate(' + tx + 'px,' + ty + 'px)rotate(' + rot + 'deg)scale(' + (sc / 1000) + ')';
     b.el.style.opacity = op / 100;
-
     bodies[write++] = b;
   }
   bodies.length = write;
@@ -1671,14 +1368,12 @@ function grow() {
     sz += GROW_RATE;
   }
 
-  // 漸進成長はダーティフラグ（1フレーム1回だけ更新）
-  // 階段ジャンプ時は即座に更新（視覚的に重要）
   if (stepped) {
     updSz();
     if (ctr) {
       ctr.animate([
-        { transform: `translate(${bhx}px,${bhy}px) scale(1.15)` },
-        { transform: `translate(${bhx}px,${bhy}px) scale(1)` }
+        { transform: `translate(${mx}px,${my}px) scale(1.15)` },
+        { transform: `translate(${mx}px,${my}px) scale(1)` }
       ], { duration: 300, easing: 'ease-out' });
     }
   } else {
@@ -1687,12 +1382,7 @@ function grow() {
 }
 
 /* ==== 環境パーティクル ==== */
-let lastAmbSpawn = performance.now();
-function startAmb() {
-  // rAFループ内でタイムスタンプベースで制御（setInterval廃止）
-  lastAmbSpawn = performance.now();
-}
-
+let lastAmbSpawn = 0;
 function trySpawnAmb(ts) {
   if (!on || sz < PHASE2 || ambCnt >= 5) return;
   if (ts - lastAmbSpawn < 800) return;
@@ -1708,7 +1398,7 @@ function spawnAmb() {
   const col = cols[Math.random() * cols.length | 0];
   const ang = Math.random() * Math.PI * 2;
   const dist = sz * 0.8 + Math.random() * 30;
-  const sx = bhx + Math.cos(ang) * dist, sy = bhy + Math.sin(ang) * dist;
+  const sx = mx + Math.cos(ang) * dist, sy = my + Math.sin(ang) * dist;
   const dur = 2000 + Math.random() * 1500;
 
   Object.assign(p.style, {
@@ -1721,8 +1411,8 @@ function spawnAmb() {
   ambParts.add(p);
 
   const ma = ang + Math.PI * 0.7, md = dist * 0.5;
-  const midX = bhx + Math.cos(ma)*md - sx, midY = bhy + Math.sin(ma)*md - sy;
-  const endX = bhx - sx, endY = bhy - sy;
+  const midX = mx + Math.cos(ma)*md - sx, midY = my + Math.sin(ma)*md - sy;
+  const endX = mx - sx, endY = my - sy;
 
   p.animate([
     { transform: 'translate(0,0) scale(0.5)', opacity: 0 },
@@ -1747,7 +1437,7 @@ function cpLength(str, offset) {
   if (code <= 0xDBFF && offset + 1 < str.length) return 2;
   // 複合グラフェム（絵文字ZWJシーケンス等）のみSegmenter使用
   if (_segmenter) {
-    const snippet = str.slice(offset, offset + 20);  // 最大20文字でZWJ最長をカバー
+    const snippet = str.slice(offset, offset + 20);
     const iter = _segmenter.segment(snippet)[Symbol.iterator]();
     const first = iter.next();
     if (!first.done) return first.value.segment.length;
@@ -1766,14 +1456,11 @@ function charRect(tn, i, len) {
 
 function hasVisibleText(el) {
   if (el.tagName && LEAF_TAGS.has(el.tagName)) return false;
-  const tc = el.textContent;
-  if (!tc || !tc.trim()) return false;
-  // 高速パス: textContentが十分長ければテキストあり（erasedスパンのtextは空なので影響小）
-  if (tc.trim().length > 1) return true;
-  // 1文字のみの場合: erasedかどうかTreeWalkerで確認
+  // テキストノードを再帰走査し、可視テキストが残っているかチェック
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
   let node;
   while ((node = walker.nextNode())) {
+    // data-bh-erased span内のテキストは無視（既に透明化済み）
     if (node.parentElement && node.parentElement.hasAttribute('data-bh-erased')) continue;
     if (node.textContent.trim()) return true;
   }
