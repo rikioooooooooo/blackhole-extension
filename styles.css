@@ -14,7 +14,7 @@
   will-change: transform;
 }
 
-/* ==== 真っ黒な真円 ==== */
+/* ==== ブラックホール本体 — 物理的な存在感 ==== */
 #bh-container .bh-core {
   position: absolute;
   width: var(--bh-size);
@@ -22,9 +22,50 @@
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  background: #000;
   border-radius: 50%;
   z-index: 3;
+
+  /* 奥行きのある球体感 — flat黒ではなく微妙なグラデーション */
+  background:
+    radial-gradient(
+      ellipse 40% 35% at 38% 35%,
+      rgba(60, 60, 80, 0.25) 0%,
+      transparent 100%
+    ),
+    radial-gradient(
+      circle at 50% 50%,
+      #050510 0%,
+      #000005 40%,
+      #000 70%
+    );
+
+  /* 事象の地平線の縁 — 微かな光の屈折 */
+  box-shadow:
+    0 0 calc(var(--bh-size) * 0.15) rgba(100, 80, 160, 0.3),
+    0 0 calc(var(--bh-size) * 0.4) rgba(60, 40, 120, 0.15),
+    inset 0 0 calc(var(--bh-size) * 0.2) rgba(30, 20, 60, 0.5);
+}
+
+/* ==== シャドウテール（移動方向の反対に伸びる影） ==== */
+#bh-container .bh-tail {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--bh-size);
+  height: var(--bh-size);
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  z-index: 2;
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(20, 10, 40, 0.6) 0%,
+    rgba(10, 5, 25, 0.3) 40%,
+    transparent 70%
+  );
+  filter: blur(calc(var(--bh-size) * 0.15));
+  opacity: 0;
+  will-change: transform, opacity;
+  transition: opacity 0.3s ease;
 }
 
 /* ==== 成長バウンス ==== */
