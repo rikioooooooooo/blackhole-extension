@@ -11,7 +11,7 @@
   height: 0;
   z-index: 2147483647;
   pointer-events: none;
-  will-change: transform;
+  contain: layout style;
 }
 
 /* ==== 真っ黒な真円 ==== */
@@ -62,13 +62,13 @@
   border-radius: 50%;
   pointer-events: none;
   z-index: 2147483645;
-  will-change: transform, opacity;
+  contain: layout style paint;
 }
 
 /* ==== 吸い込まれる要素 ==== */
 [data-bh-absorbing="true"] {
   pointer-events: none !important;
-  will-change: transform, opacity !important;
+  contain: layout style paint !important;
   z-index: 2147483645 !important;
 }
 

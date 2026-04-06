@@ -15,11 +15,12 @@
 const BH_INITIAL  = 12;
 const BH_FIELD    = 4;
 
-const GRAVITY     = 3000;
-const TANGENT     = 0.08;
-const DAMPING     = 0.995;
-const MAX_SPEED   = 1200;
-const INIT_SPEED  = 300;
+const GRAVITY     = 5000;
+const TANGENT     = 0.12;
+const DAMPING     = 0.990;
+const MAX_SPEED   = 1600;
+const INIT_SPEED  = 200;
+const MAX_SPEED_SQ = MAX_SPEED * MAX_SPEED;
 
 const GROW_RATE   = 0.03;
 const MAX_BODIES  = 800;
@@ -98,25 +99,44 @@ function getCachedBgImage(el) {
 let _ptsFlat = new Float64Array(512);
 let _ptsLen = 0;
 const _triedEls = new Set();
+const _sweepOffsets = new Map();
 
 /* ==== DOM defrag ==== */
 const _dirtyParents = new Set();
 let _lastNormalize = 0;
 function maybeNormalize(ts) {
   if (_dirtyParents.size === 0) return;
-  if (ts - _lastNormalize < 1000) return;
+  if (ts - _lastNormalize < 800) return;
   _lastNormalize = ts;
+  const parents = [];
   let count = 0;
   for (const el of _dirtyParents) {
-    if (count >= 50) break;
-    try { el.normalize(); } catch {}
+    if (count >= 80) break;
+    parents.push(el);
     _dirtyParents.delete(el);
     count++;
+  }
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback((deadline) => {
+      _suppressMutationHandler = true;
+      for (const el of parents) {
+        if (deadline.timeRemaining() < 1) { _dirtyParents.add(el); continue; }
+        try { el.normalize(); } catch {}
+      }
+      spaObs.takeRecords();
+      _suppressMutationHandler = false;
+    }, { timeout: 3000 });
+  } else {
+    _suppressMutationHandler = true;
+    for (const el of parents) { try { el.normalize(); } catch {} }
+    spaObs.takeRecords();
+    _suppressMutationHandler = false;
   }
 }
 
 /* ==== こすくま保護 ==== */
 const KOSUKUMA_RE = /こすくま|こす[.．・]くま|kosukuma|kosu[._\-]kuma/i;
+const KOSUKUMA_RE_G = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
 
 /* 階段式成長テーブル: [吸収数, ジャンプ先サイズ] */
 const GROWTH_STEPS = [
@@ -330,14 +350,14 @@ function launchRestore(job, bhX, bhY, total, onDone) {
       `font-size:${job.fontSize};font-family:${job.fontFamily};` +
       `font-weight:${job.fontWeight};color:${job.color};` +
       `line-height:1;margin:0;padding:0;background:none;` +
-      `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;` +
+      `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;` +
       `transform:scale(0);opacity:0;`;
   } else {
     p.textContent = '';
     p.style.cssText =
       `position:fixed;left:${bhX}px;top:${bhY}px;width:8px;height:8px;` +
       `background:#888;border-radius:50%;` +
-      `pointer-events:none;z-index:2147483645;will-change:transform;` +
+      `pointer-events:none;z-index:2147483645;contain:layout style paint;` +
       `transform:scale(0);opacity:0;`;
   }
   document.body.appendChild(p);
@@ -478,14 +498,13 @@ function isProtectedChar(tn, offset) {
   // テキストノード内でのオフセットを使って判定
   const text = tn.textContent;
   let match;
-  const re = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
-  while ((match = re.exec(text)) !== null) {
+  KOSUKUMA_RE_G.lastIndex = 0;
+  while ((match = KOSUKUMA_RE_G.exec(text)) !== null) {
     if (offset >= match.index && offset < match.index + match[0].length) return true;
   }
 
   // 親・祖父要素内で分割されたケース: テキストノードの前後のテキストを結合して判定
   if (p) {
-    let accumulated = 0;
     const walker = document.createTreeWalker(p, NodeFilter.SHOW_TEXT, null);
     let n;
     let fullText = '';
@@ -495,8 +514,8 @@ function isProtectedChar(tn, offset) {
       fullText += n.textContent;
     }
     if (globalOffset >= 0 && fullText.length < 2000) {
-      const re2 = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
-      while ((match = re2.exec(fullText)) !== null) {
+      KOSUKUMA_RE_G.lastIndex = 0;
+      while ((match = KOSUKUMA_RE_G.exec(fullText)) !== null) {
         if (globalOffset >= match.index && globalOffset < match.index + match[0].length) return true;
       }
     }
@@ -508,7 +527,7 @@ function isProtectedChar(tn, offset) {
 /* ================================================================
    メインループ
    ================================================================ */
-let skipPeel = false;
+let reducedPeel = false;
 let _skipPeelFrames = 0;
 
 function loop(ts) {
@@ -530,7 +549,7 @@ function loop(ts) {
   const moved = Math.hypot(mx - prevMx, my - prevMy) > 2;
   if (_skipPeelFrames > 0) {
     _skipPeelFrames--;
-  } else if (!skipPeel || moved) {
+  } else {
     peel();
   }
 
@@ -546,7 +565,7 @@ function loop(ts) {
   _suppressMutationHandler = false;
 
   const elapsed = performance.now() - frameStart;
-  skipPeel = elapsed > 12 && bodies.length > 200;
+  reducedPeel = elapsed > 12 && bodies.length > 200;
 
   raf = requestAnimationFrame(loop);
 }
@@ -561,14 +580,14 @@ function loop(ts) {
 function peel() {
   if (bodies.length >= MAX_BODIES) return;
 
-  const baseRate = Math.min(20, 3 + Math.floor(sz / 20));
+  const baseRate = Math.min(28, 4 + Math.floor(sz / 15));
   const pressure = bodies.length / MAX_BODIES;
   const rate = pressure > 0.7 ? Math.max(3, Math.floor(baseRate * (1 - pressure))) : baseRate;
-  const touchR = sz / 2 + 3;
+  const touchR = sz / 2 * 1.15 + 1;
   const vw = window.innerWidth, vh = window.innerHeight;
 
-  const nAngles = Math.min(16, 4 + Math.floor(sz / 20));
-  const nRings  = Math.min(5, 2 + Math.floor(sz / 60));
+  const nAngles = Math.min(32, 6 + Math.floor(sz / 10));
+  const nRings  = Math.min(7, 2 + Math.floor(sz / 40));
 
   _ptsLen = 0;
   function pushPt(x, y) {
@@ -582,6 +601,33 @@ function peel() {
     _ptsFlat[_ptsLen++] = x;
     _ptsFlat[_ptsLen++] = y;
   }
+
+  // 大型BH: 外側リングを先に（budgetを新領域に優先配分）
+  // 小型BH: 中心を先に（従来通り）
+  const edgeFirst = sz > 60;
+
+  // Interleaved angle scanning: half per frame
+  // 大型BH: innerFracを下げて内部全域をカバー（旧: 0.65@sz400 → 死角85%）
+  const innerFrac = sz > 150 ? 0.15 : sz > 60 ? 0.35 - (sz - 60) * 0.0022 : 0.35;
+  if (edgeFirst) {
+    // 外側リングから内側、全角度を毎フレーム走査（インターリーブ廃止）
+    // + 最外周98%リングを追加して境界のテキスト残りを排除
+    const edgeAngles = Math.min(nAngles, 16);
+    const edgeOff = samplePhase * 0.618;  // 黄金角オフセットでフレーム間カバレッジ向上
+    for (let i = 0; i < edgeAngles; i++) {
+      const ang = ((edgeOff + i) / edgeAngles) * Math.PI * 2;
+      pushPt(mx + Math.cos(ang) * touchR * 0.98, my + Math.sin(ang) * touchR * 0.98);
+    }
+    for (let r = nRings; r >= 1; r--) {
+      const frac = innerFrac + (r / (nRings + 0.15)) * (1 - innerFrac);
+      for (let i = 0; i < nAngles; i++) {
+        const ang = ((samplePhase * 0.618 + i) / nAngles) * Math.PI * 2;
+        pushPt(mx + Math.cos(ang) * touchR * frac, my + Math.sin(ang) * touchR * frac);
+      }
+    }
+  }
+
+  // 中心点（小型BHでは最初、大型BHでは後）
   pushPt(mx, my);
 
   // High speed interpolation
@@ -593,21 +639,22 @@ function peel() {
       const ix = prevMx + (mx - prevMx) * t;
       const iy = prevMy + (my - prevMy) * t;
       pushPt(ix, iy);
-      for (let a = 0; a < 4; a++) {
-        const ang = (a / 4) * Math.PI * 2;
+      for (let a = 0; a < 8; a++) {
+        const ang = (a / 8) * Math.PI * 2;
         pushPt(ix + Math.cos(ang) * touchR * 0.5, iy + Math.sin(ang) * touchR * 0.5);
+        pushPt(ix + Math.cos(ang) * touchR * 0.9, iy + Math.sin(ang) * touchR * 0.9);
       }
     }
   }
 
-  // Interleaved angle scanning: half per frame
-  const innerFrac = 0.35;
-  for (let i = samplePhase % 2; i < nAngles; i += 2) {
-    const a = ((samplePhase + i) % (nAngles * 2));
-    const ang = (a / (nAngles * 2)) * Math.PI * 2;
-    for (let r = 1; r <= nRings; r++) {
-      const frac = innerFrac + (r / (nRings + 1)) * (1 - innerFrac);
-      pushPt(mx + Math.cos(ang) * touchR * frac, my + Math.sin(ang) * touchR * frac);
+  if (!edgeFirst) {
+    // 小型BH: 従来通り内側から外側へ（全角度毎フレーム）
+    for (let i = 0; i < nAngles; i++) {
+      const ang = ((samplePhase * 0.618 + i) / nAngles) * Math.PI * 2;
+      for (let r = 1; r <= nRings; r++) {
+        const frac = innerFrac + (r / (nRings + 0.15)) * (1 - innerFrac);
+        pushPt(mx + Math.cos(ang) * touchR * frac, my + Math.sin(ang) * touchR * frac);
+      }
     }
   }
   samplePhase++;
@@ -618,9 +665,9 @@ function peel() {
   let n = 0;
   let caretCalls = 0;
   let elemCalls = 0;
-  const MAX_CARET_PER_FRAME = 12;
+  const MAX_CARET_PER_FRAME = reducedPeel ? 12 : 36;
   const MAX_ELEM_PER_FRAME = 16;
-  const PEEL_BUDGET_MS = 4;
+  const PEEL_BUDGET_MS = reducedPeel ? 4 : Math.min(8, 7 - bodies.length * 0.005);
   const peelStart = performance.now();
 
   /* ---- Pass 1: READ — collect all hits without DOM writes ---- */
@@ -745,6 +792,103 @@ function peel() {
 
     elemHits.push({ type: 'absorbWithPseudo', el, rect: r });
     n++;
+  }
+
+  /* ---- Pass 1.5: Neighbor sweep — ヒット済みテキストノードの全文字をBH半径内でスイープ ---- */
+  const touchRSq = touchR * touchR;
+  _sweepOffsets.clear();
+  for (const h of textHits) {
+    if (!_sweepOffsets.has(h.tn)) _sweepOffsets.set(h.tn, new Set());
+    _sweepOffsets.get(h.tn).add(h.offset);
+  }
+  let sweepBudget = reducedPeel ? 20 : 60;
+  for (const [tn, offsets] of _sweepOffsets) {
+    if (sweepBudget <= 0) break;
+    const text = tn.textContent;
+    if (!text) continue;
+    const pe = tn.parentElement;
+    if (!pe) continue;
+    // 親要素矩形でBH圏外を一括スキップ（charRect呼び出しを大幅削減）
+    const peRect = pe.getBoundingClientRect();
+    const clX = Math.max(peRect.left, Math.min(mx, peRect.right));
+    const clY = Math.max(peRect.top, Math.min(my, peRect.bottom));
+    if ((clX - mx) * (clX - mx) + (clY - my) * (clY - my) > touchRSq) continue;
+    if (sz < PHASE_FIXED) {
+      const pos = getCachedPosition(pe);
+      if (pos === 'fixed' || pos === 'sticky') continue;
+    }
+    for (let off = 0; off < text.length && sweepBudget > 0; ) {
+      const cpl = cpLength(text, off);
+      if (offsets.has(off)) { off += cpl; continue; }
+      const ch = text.slice(off, off + cpl);
+      if (!ch.trim() || ch === '\n' || ch === '\r' || ch === '\t') { off += cpl; continue; }
+      if (isProtectedChar(tn, off)) { off += cpl; continue; }
+      const rc = charRect(tn, off, cpl);
+      if (!rc || rc.width < 0.3 || rc.height < 0.3) { off += cpl; continue; }
+      const ccx = rc.left + rc.width / 2, ccy = rc.top + rc.height / 2;
+      const ddx = ccx - mx, ddy = ccy - my;
+      if (ddx * ddx + ddy * ddy <= touchRSq) {
+        textHits.push({ tn, offset: off, cpLen: cpl, parentEl: pe, charRect: rc });
+        offsets.add(off);
+        sweepBudget--;
+      }
+      off += cpl;
+    }
+  }
+
+  /* ---- Pass 1.75: Sibling sweep — ヒット済みテキストノードの直接親要素内の兄弟テキストノードも走査 ---- */
+  if (!reducedPeel) {
+    const sibStart = performance.now();
+    const SIB_BUDGET_MS = 2;
+    const _siblingParents = new Set();
+    for (const [tn] of _sweepOffsets) {
+      const pe = tn.parentElement;
+      if (pe && pe !== document.body && pe !== document.documentElement) {
+        _siblingParents.add(pe);
+      }
+    }
+    let sibBudget = 30;
+    for (const parent of _siblingParents) {
+      if (sibBudget <= 0 || performance.now() - sibStart > SIB_BUDGET_MS) break;
+      if (parent.childNodes.length > 30) continue;
+      // 親要素矩形でBH圏外を一括スキップ
+      const pRect = parent.getBoundingClientRect();
+      const cpX = Math.max(pRect.left, Math.min(mx, pRect.right));
+      const cpY = Math.max(pRect.top, Math.min(my, pRect.bottom));
+      if ((cpX - mx) * (cpX - mx) + (cpY - my) * (cpY - my) > touchRSq) continue;
+      const walker = document.createTreeWalker(parent, NodeFilter.SHOW_TEXT);
+      let stn;
+      while ((stn = walker.nextNode()) && sibBudget > 0) {
+        if (performance.now() - sibStart > SIB_BUDGET_MS) break;
+        if (_sweepOffsets.has(stn)) continue;
+        const stxt = stn.textContent;
+        if (!stxt || !stxt.trim()) continue;
+        const spe = stn.parentElement;
+        if (!spe || spe.hasAttribute('data-bh-erased')) continue;
+        if (sz < PHASE_FIXED) {
+          const pos = getCachedPosition(spe);
+          if (pos === 'fixed' || pos === 'sticky') continue;
+        }
+        const sOffsets = new Set();
+        _sweepOffsets.set(stn, sOffsets);
+        for (let off = 0; off < stxt.length && sibBudget > 0; ) {
+          const cpl = cpLength(stxt, off);
+          const ch = stxt.slice(off, off + cpl);
+          if (!ch.trim() || ch === '\n' || ch === '\r' || ch === '\t') { off += cpl; continue; }
+          if (isProtectedChar(stn, off)) { off += cpl; continue; }
+          const rc = charRect(stn, off, cpl);
+          if (!rc || rc.width < 0.3 || rc.height < 0.3) { off += cpl; continue; }
+          const ccx = rc.left + rc.width / 2, ccy = rc.top + rc.height / 2;
+          const ddx = ccx - mx, ddy = ccy - my;
+          if (ddx * ddx + ddy * ddy <= touchRSq) {
+            textHits.push({ tn: stn, offset: off, cpLen: cpl, parentEl: spe, charRect: rc });
+            sOffsets.add(off);
+            sibBudget--;
+          }
+          off += cpl;
+        }
+      }
+    }
   }
 
   /* ---- Pass 2: WRITE — apply DOM mutations from collected hits ---- */
@@ -904,7 +1048,7 @@ function mkPseudoBody(text, rc, rawSt) {
     `font-size:${st.fontSize || '16px'};font-family:${st.fontFamily || 'inherit'};` +
     `font-weight:${st.fontWeight || 'normal'};color:${st.color || '#000'};` +
     `line-height:1;margin:0;padding:0;background:none;` +
-    `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+    `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;`;
   document.body.appendChild(p);
 
   const cx = rc.left + rc.width / 2, cy = rc.top + rc.height / 2;
@@ -956,7 +1100,7 @@ function mkCharBody(span, rc, parentEl) {
     `font-size:${st ? st.fontSize : '16px'};font-family:${st ? st.fontFamily : 'inherit'};` +
     `font-weight:${st ? st.fontWeight : 'normal'};color:${st ? st.color : '#000'};` +
     `line-height:1;margin:0;padding:0;background:none;` +
-    `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+    `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;`;
   document.body.appendChild(p);
 
   const cx = rc.left + rc.width / 2, cy = rc.top + rc.height / 2;
@@ -991,7 +1135,7 @@ function absorbEl(el, r) {
     `position:fixed;left:${r.left}px;top:${r.top}px;` +
     `width:${r.width}px;height:${r.height}px;` +
     `margin:0;pointer-events:none;overflow:hidden;` +
-    `z-index:2147483645;will-change:transform;`;
+    `z-index:2147483645;contain:layout style paint;`;
   document.body.appendChild(clone);
 
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
@@ -1026,7 +1170,7 @@ function tileImg(img) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;`;
       d.style.backgroundImage = `url("${src.replace(/["\\()]/g, '\\$&')}")`;
       d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
       d.style.backgroundSize = `${r.width}px ${r.height}px`;
@@ -1084,7 +1228,7 @@ function tileVideo(video) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;`;
       if (dataUrl) {
         d.style.backgroundImage = `url("${dataUrl}")`;
         d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
@@ -1150,7 +1294,7 @@ function tileCanvas(canvas) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;`;
       if (dataUrl) {
         d.style.backgroundImage = `url("${dataUrl}")`;
         d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
@@ -1259,7 +1403,7 @@ function tileBgImage(el, r, bgImg) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;` +
+        `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;` +
         `background:${bgImg};background-size:${r.width}px ${r.height}px;` +
         `background-position:-${col * tw}px -${row * th}px;`;
       document.body.appendChild(d);
@@ -1344,7 +1488,7 @@ function _tileWithSrc(r, src) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+        `pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;`;
       d.style.backgroundImage = `url("${src.replace(/["\\()]/g, '\\$&')}")`;
       d.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
       d.style.backgroundSize = `${r.width}px ${r.height}px`;
@@ -1382,7 +1526,7 @@ function _tileFallback(el, r, color) {
       d.className = 'bh-particle';
       d.style.cssText =
         `position:fixed;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `background:${color};pointer-events:none;z-index:2147483645;will-change:transform;border-radius:0;`;
+        `background:${color};pointer-events:none;z-index:2147483645;contain:layout style paint;border-radius:0;`;
       document.body.appendChild(d);
 
       const cx = x + w / 2, cy = y + h / 2;
@@ -1402,11 +1546,13 @@ function _tileFallback(el, r, color) {
    ================================================================ */
 function physicsAndAbsorb(dt) {
   const field = sz * BH_FIELD;
+  const fieldSq = field * field * 1.5;
   const damp = Math.pow(DAMPING, dt * 60);
   const coreSq = (sz * 0.6) * (sz * 0.6);
+  const vw = window.innerWidth, vh = window.innerHeight;
   let write = 0;
   let absorbCount = 0;
-  const MAX_ABSORB_PER_FRAME = 30;
+  const MAX_ABSORB_PER_FRAME = sz > 200 ? 50 : 30;
 
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i];
@@ -1421,6 +1567,27 @@ function physicsAndAbsorb(dt) {
       continue;
     }
 
+    // 画面外 + 重力圏外のボディをカリング
+    if (distSq > fieldSq && (b.x < -200 || b.x > vw + 200 || b.y < -200 || b.y > vh + 200)) {
+      b.el.remove();
+      continue;
+    }
+
+    // 重力圏外の遠方ボディ: sqrtスキップのfast path
+    if (distSq > fieldSq) {
+      b.vx *= damp; b.vy *= damp;
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      const tx = (b.x - b.ox) | 0;
+      const ty = (b.y - b.oy) | 0;
+      if (tx !== b._ptx || ty !== b._pty) {
+        b._ptx = tx; b._pty = ty;
+        b.el.style.transform = 'translate(' + tx + 'px,' + ty + 'px)rotate(' + (b.rot | 0) + 'deg)';
+        b.el.style.opacity = 1;
+      }
+      bodies[write++] = b;
+      continue;
+    }
+
     const dist = Math.sqrt(distSq);
     if (dist < 0.5) { bodies[write++] = b; continue; }
 
@@ -1428,21 +1595,27 @@ function physicsAndAbsorb(dt) {
     const ny = dy / dist;
 
     const t = Math.max(0, 1 - dist / field);
-    const acc = GRAVITY * (0.5 + 0.5 * t);
+    const acc = GRAVITY * (0.3 + 0.7 * t);
 
     b.vx += (nx + ny * TANGENT) * acc * dt;
     b.vy += (ny - nx * TANGENT) * acc * dt;
     b.vx *= damp;
     b.vy *= damp;
 
-    const spd = Math.hypot(b.vx, b.vy);
-    if (spd > MAX_SPEED) { const s = MAX_SPEED / spd; b.vx *= s; b.vy *= s; }
+    const spdSq = b.vx * b.vx + b.vy * b.vy;
+    let spd;
+    if (spdSq > MAX_SPEED_SQ) {
+      spd = Math.sqrt(spdSq);
+      const s = MAX_SPEED / spd; b.vx *= s; b.vy *= s;
+      spd = MAX_SPEED;
+    } else {
+      spd = Math.sqrt(spdSq);
+    }
 
     b.x += b.vx * dt;
     b.y += b.vy * dt;
 
-    const cSpd = Math.min(spd, MAX_SPEED);
-    b.rot += cSpd * dt * 0.3;
+    b.rot += spd * dt * 0.3;
 
     const scaleR = sz * 1.2;
     const scale = dist < scaleR ? Math.max(0.05, dist / scaleR) : 1;
@@ -1490,7 +1663,15 @@ function growBatch(count) {
 
   if (stepped) {
     updSz();
-    _skipPeelFrames = 2;
+    _skipPeelFrames = 1;
+    // 既存の浮遊パーティクルを全キャンセル（古いsz/mx/myで焼き込み済みのため）
+    for (const p of ambParts) {
+      p.getAnimations().forEach(a => a.cancel());
+      p.remove();
+    }
+    ambParts.clear();
+    ambCnt = 0;
+    lastAmbSpawn = 0;
     // Animate .bh-core child instead of ctr to avoid WAAPI conflict with updPos() transform
     const core = ctr && ctr.querySelector('.bh-core');
     if (core) {
@@ -1507,8 +1688,10 @@ function growBatch(count) {
 /* ==== 環境パーティクル ==== */
 let lastAmbSpawn = 0;
 function trySpawnAmb(ts) {
-  if (!on || sz < PHASE2 || ambCnt >= 5) return;
-  if (ts - lastAmbSpawn < 800) return;
+  const ambMax = sz >= 300 ? 12 : sz >= 220 ? 9 : sz >= PHASE2 ? 7 : sz >= 95 ? 3 : 0;
+  if (!on || ambMax === 0 || ambCnt >= ambMax) return;
+  const ambInterval = sz >= 300 ? 350 : sz >= 220 ? 500 : 600;
+  if (ts - lastAmbSpawn < ambInterval) return;
   lastAmbSpawn = ts;
   spawnAmb();
 }
@@ -1516,7 +1699,7 @@ function trySpawnAmb(ts) {
 function spawnAmb() {
   const p = document.createElement('div');
   p.className = 'bh-particle';
-  const s = 2 + Math.random() * 2;
+  const s = sz >= 300 ? 2 + Math.random() * 4 : 2 + Math.random() * 2;
   const cols = sz >= 300 ? COL3 : sz >= PHASE2 ? COL2 : COL1;
   const col = cols[Math.random() * cols.length | 0];
   const ang = Math.random() * Math.PI * 2;
@@ -1568,11 +1751,11 @@ function cpLength(str, offset) {
   return 1;
 }
 
+const _charRange = document.createRange();
 function charRect(tn, i, len) {
   try {
-    const r = document.createRange();
-    r.setStart(tn, i); r.setEnd(tn, i + len);
-    const rects = r.getClientRects();
+    _charRange.setStart(tn, i); _charRange.setEnd(tn, i + len);
+    const rects = _charRange.getClientRects();
     return rects.length ? rects[0] : null;
   } catch { return null; }
 }
