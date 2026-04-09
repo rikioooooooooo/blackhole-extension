@@ -53,6 +53,7 @@ let totalAbsorbed = 0;
 
 let szDirty = false;
 let lastPosMx = -1, lastPosMy = -1;
+let frameCount = 0;
 
 /* ==== MutationObserver フレーム抑制 ==== */
 let _suppressMutationHandler = false;
@@ -104,6 +105,81 @@ const _sweepOffsets = new Map();
 /* ==== DOM defrag ==== */
 const _dirtyParents = new Set();
 let _lastNormalize = 0;
+
+/* ==== SPA再消去（文字復活防止） ==== */
+const _dirtyReEraseTargets = new Set();
+let _reEraseScheduled = false;
+function _scheduleReErase() {
+  if (_reEraseScheduled) return;
+  _reEraseScheduled = true;
+  requestAnimationFrame(() => {
+    _reEraseScheduled = false;
+    if (!on) { _dirtyReEraseTargets.clear(); return; }
+    _suppressMutationHandler = true;
+    const remaining = new Set();
+    for (const el of _dirtyReEraseTargets) {
+      if (!el.isConnected) continue;
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+      let tn;
+      let didErase = false;
+      while ((tn = walker.nextNode())) {
+        const p = tn.parentElement;
+        if (!p || p.hasAttribute('data-bh-erased')) continue;
+        const text = tn.textContent;
+        if (!text.trim()) continue;
+        for (let i = 0; i < text.length; i++) {
+          const cpl = cpLength(text, i);
+          const ch = text.slice(i, i + cpl);
+          if (!ch.trim()) continue;
+          if (isProtectedChar(tn, i)) continue;
+          const span = eraseChar(tn, i, cpl);
+          if (span) {
+            didErase = true;
+            break; // TreeWalker無効化
+          }
+        }
+        if (didErase) break; // 外側ループも抜ける
+      }
+      if (didErase) {
+        remaining.add(el); // まだ残っているので次フレームも処理
+      }
+    }
+    _dirtyReEraseTargets.clear();
+    for (const el of remaining) _dirtyReEraseTargets.add(el);
+    spaObs.takeRecords();
+    _suppressMutationHandler = false;
+    // まだ未処理のターゲットがあれば再スケジュール
+    if (_dirtyReEraseTargets.size > 0) {
+      _scheduleReErase();
+    }
+  });
+}
+function _reEraseViewport() {
+  // BH半径内の領域をサンプリングして、erasedでないテキストを検出・再消去
+  const scanR = Math.min(sz * 0.8, 300);
+  const step = 40;
+  let count = 0;
+  for (let dx = -scanR; dx <= scanR && count < 5; dx += step) {
+    for (let dy = -scanR; dy <= scanR && count < 5; dy += step) {
+      if (dx * dx + dy * dy > scanR * scanR) continue;
+      const px = mx + dx, py = my + dy;
+      if (px < 0 || py < 0 || px > window.innerWidth || py > window.innerHeight) continue;
+      const range = document.caretRangeFromPoint(px, py);
+      if (!range || range.startContainer.nodeType !== 3) continue;
+      const tn = range.startContainer;
+      const offset = range.startOffset;
+      if (tn.parentElement && tn.parentElement.hasAttribute('data-bh-erased')) continue;
+      if (offset >= tn.textContent.length) continue;
+      const cpl = cpLength(tn.textContent, offset);
+      const ch = tn.textContent.slice(offset, offset + cpl);
+      if (!ch.trim()) continue;
+      if (isProtectedChar(tn, offset)) continue;
+      // この文字はerasedであるべきなのにerasedでない → 再消去
+      eraseChar(tn, offset, cpl);
+      count++;
+    }
+  }
+}
 function maybeNormalize(ts) {
   if (_dirtyParents.size === 0) return;
   if (ts - _lastNormalize < 800) return;
@@ -121,6 +197,8 @@ function maybeNormalize(ts) {
       _suppressMutationHandler = true;
       for (const el of parents) {
         if (deadline.timeRemaining() < 1) { _dirtyParents.add(el); continue; }
+        // erased spanが残っている親はnormalizeすると透明化が壊れるのでスキップ
+        if (el.querySelector && el.querySelector('[data-bh-erased]')) { _dirtyParents.add(el); continue; }
         try { el.normalize(); } catch {}
       }
       spaObs.takeRecords();
@@ -128,14 +206,25 @@ function maybeNormalize(ts) {
     }, { timeout: 3000 });
   } else {
     _suppressMutationHandler = true;
-    for (const el of parents) { try { el.normalize(); } catch {} }
+    for (const el of parents) {
+      if (el.querySelector && el.querySelector('[data-bh-erased]')) { _dirtyParents.add(el); continue; }
+      try { el.normalize(); } catch {}
+    }
     spaObs.takeRecords();
     _suppressMutationHandler = false;
   }
 }
 
 /* ==== こすくま保護 ==== */
-const KOSUKUMA_RE = /こすくま|こす[.．・]くま|kosukuma|kosu[._\-]kuma/i;
+// ZW = ゼロ幅文字クラス（Gmail/CloudSignが挿入するU+2060 WORD JOINER等を許容）
+const _ZW = '[\u200B-\u200D\u2060\uFEFF\u00AD]*';
+const KOSUKUMA_RE = new RegExp(
+  'こ'+_ZW+'す'+_ZW+'く'+_ZW+'ま|' +
+  'こ'+_ZW+'す'+_ZW+'[.．・]'+_ZW+'く'+_ZW+'ま|' +
+  'k'+_ZW+'o'+_ZW+'s'+_ZW+'u'+_ZW+'k'+_ZW+'u'+_ZW+'m'+_ZW+'a|' +
+  'k'+_ZW+'o'+_ZW+'s'+_ZW+'u'+_ZW+'[._\\-]'+_ZW+'k'+_ZW+'u'+_ZW+'m'+_ZW+'a',
+  'i'
+);
 const KOSUKUMA_RE_G = new RegExp(KOSUKUMA_RE.source, KOSUKUMA_RE.flags + 'g');
 
 /* 階段式成長テーブル: [吸収数, ジャンプ先サイズ] */
@@ -170,11 +259,28 @@ const spaObs = new MutationObserver((mutations) => {
   if (!on) return;
   for (const m of mutations) {
     if (m.type !== 'childList') continue;
+
+    // SPA対策: フレームワークがdata-bh-erasedスパンを削除→テキストノード復活を検出
+    for (const node of m.removedNodes) {
+      if (node.nodeType === 1) {
+        // 直接のdata-bh-erasedスパン削除、またはdata-bh-erasedを含む親要素の削除
+        if ((node.hasAttribute && node.hasAttribute('data-bh-erased')) ||
+            (node.querySelector && node.querySelector('[data-bh-erased]'))) {
+          const target = m.target;
+          if (target && target.nodeType === 1) {
+            _dirtyReEraseTargets.add(target);
+          }
+        }
+      }
+    }
+
     for (const node of m.addedNodes) {
       if (node.nodeType !== 1) continue;
       // 親が吸収済みなら新しい子も隠す
       const parent = node.parentElement;
       if (parent && parent.getAttribute('data-bh') === '1') {
+        // こすくま保護: 保護テキストを含むノードは隠さない
+        if (node.textContent && KOSUKUMA_RE.test(node.textContent)) continue;
         node.style.visibility = 'hidden';
         node.style.pointerEvents = 'none';
         continue;
@@ -197,6 +303,11 @@ const spaObs = new MutationObserver((mutations) => {
       }
     }
   }
+
+  // 復活したテキストを再消去（バッチ処理）
+  if (_dirtyReEraseTargets.size > 0) {
+    _scheduleReErase();
+  }
 });
 spaObs.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
@@ -214,7 +325,7 @@ function activate() {
   if (!document.getElementById('bh-erased-style')) {
     const st = document.createElement('style');
     st.id = 'bh-erased-style';
-    st.textContent = '[data-bh-erased]{color:transparent!important}';
+    st.textContent = '[data-bh-erased][data-bh-erased]{color:transparent!important;-webkit-text-fill-color:transparent!important}';
     document.head.appendChild(st);
   }
 
@@ -331,11 +442,10 @@ function off() {
       const newSz = Math.max(BH_INITIAL, startSz * (1 - progress * 0.9));
       if (ctr) {
         ctr.style.setProperty('--bh-size', newSz + 'px');
-        // 吐き出し時に微振動
-        if (i % 5 === 0) {
+        // 吐き出し時に微振動（offsetHeight強制リフロー排除: animation再トリガーをrAFで分離）
+        if (i % 8 === 0) {
           ctr.classList.remove('bh-gulp');
-          void ctr.offsetHeight;
-          ctr.classList.add('bh-gulp');
+          requestAnimationFrame(() => { if (ctr) ctr.classList.add('bh-gulp'); });
         }
       }
 
@@ -461,6 +571,11 @@ function finishOff() {
   // erased style rule除去
   const erasedStyle = document.getElementById('bh-erased-style');
   if (erasedStyle) erasedStyle.remove();
+  // Shadow DOM内のerased-styleも除去
+  const shadowStyles = document.querySelectorAll('#bh-erased-style-shadow');
+  for (const s of shadowStyles) s.remove();
+  // 再消去キューをクリア
+  _dirtyReEraseTargets.clear();
 
   for (const t of tids) clearTimeout(t);
   tids.clear();
@@ -524,8 +639,6 @@ function updSz() {
 
 /** こすくま保護: 指定オフセットの文字が保護ワードの一部か判定 */
 function isProtectedChar(tn, offset) {
-  const p = tn.parentElement;
-
   // テキストノード内でのオフセットを使って判定
   const text = tn.textContent;
   let match;
@@ -534,17 +647,24 @@ function isProtectedChar(tn, offset) {
     if (offset >= match.index && offset < match.index + match[0].length) return true;
   }
 
-  // 親・祖父要素内で分割されたケース: テキストノードの前後のテキストを結合して判定
-  if (p) {
-    const walker = document.createTreeWalker(p, NodeFilter.SHOW_TEXT, null);
+  // 8階層まで遡って分割されたケースを検出
+  // (Gmail等の深いDOM構造やeraseCharのspan挿入で "こすくま" が複数ノードに跨る場合)
+  let el = tn.parentElement;
+  for (let depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+    if (el === document.body || el === document.documentElement) break;
+    // 巨大コンテナは走査コストが高すぎるのでスキップ
+    if (el.childNodes.length > 200) continue;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
     let n;
     let fullText = '';
     let globalOffset = -1;
     while ((n = walker.nextNode())) {
       if (n === tn) globalOffset = fullText.length + offset;
       fullText += n.textContent;
+      if (fullText.length > 2000) break;
     }
-    if (globalOffset >= 0 && fullText.length < 2000) {
+    if (fullText.length > 2000) continue;
+    if (globalOffset >= 0) {
       KOSUKUMA_RE_G.lastIndex = 0;
       while ((match = KOSUKUMA_RE_G.exec(fullText)) !== null) {
         if (globalOffset >= match.index && globalOffset < match.index + match[0].length) return true;
@@ -591,12 +711,19 @@ function loop(ts) {
   trySpawnAmb(ts);
   maybeNormalize(ts);
 
+  // 定期フルスキャン（安全ネット）: BH半径内の可視テキストを再スキャン
+  frameCount++;
+  if (frameCount % 60 === 0) {
+    _reEraseViewport();
+  }
+
   // フレーム終了: 溜まったmutationを破棄してからobserver再開
   spaObs.takeRecords();
   _suppressMutationHandler = false;
 
   const elapsed = performance.now() - frameStart;
-  reducedPeel = elapsed > 12 && bodies.length > 200;
+  // 120fps目標: 8ms超で間引き開始（16.6msの48%でまだ余裕あり）
+  reducedPeel = elapsed > 8;
 
   raf = requestAnimationFrame(loop);
 }
@@ -707,14 +834,14 @@ function peel() {
 
   for (let pi = 0; pi < _ptsLen; pi += 2) {
     if (n >= rate) break;
-    if (performance.now() - peelStart > PEEL_BUDGET_MS) break;
+    // performance.now()を4反復ごとにチェック（呼び出しコスト削減）
+    if ((pi & 6) === 0 && performance.now() - peelStart > PEEL_BUDGET_MS) break;
     const px = _ptsFlat[pi], py = _ptsFlat[pi + 1];
 
     // ① テキスト文字を検出 (READ only)
     if (caretCalls < MAX_CARET_PER_FRAME) {
       const range = document.caretRangeFromPoint(px, py);
       caretCalls++;
-      if (performance.now() - peelStart > PEEL_BUDGET_MS) break;
       if (range && range.startContainer.nodeType === 3) {
         const tn = range.startContainer;
         const offset = range.startOffset;
@@ -727,6 +854,8 @@ function peel() {
             const rc = charRect(tn, offset, cpLen);
             if (rc && rc.width > 0.3 && rc.height > 0.3) {
               const pe = tn.parentElement;
+              // contenteditable領域はSPAの入力を壊すのでスキップ
+              if (pe && pe.isContentEditable) continue;
               if (pe && sz < PHASE_FIXED) {
                 const pos = getCachedPosition(pe);
                 if (pos === 'fixed' || pos === 'sticky') continue;
@@ -744,7 +873,6 @@ function peel() {
     if (elemCalls >= MAX_ELEM_PER_FRAME) continue;
     const el = document.elementFromPoint(px, py);
     elemCalls++;
-    if (performance.now() - peelStart > PEEL_BUDGET_MS) break;
     if (!el || _triedEls.has(el)) continue;
     _triedEls.add(el);
     if (SKIP.has(el.tagName)) continue;
@@ -1024,6 +1152,7 @@ function peelPseudo(el) {
       }
     }
     if (markerText) {
+      if (KOSUKUMA_RE.test(markerText)) { _pseudoHandled.add(el); return; }
       const r = el.getBoundingClientRect();
       const st = getCachedFullStyle(el);
       const rawSt = getComputedStyle(el);
@@ -1053,6 +1182,7 @@ function peelPseudo(el) {
       // contentからテキストを抽出
       let text = content.replace(/^["']|["']$/g, '');
       if (!text || text === 'counter' || text.startsWith('counter(')) continue;
+      if (KOSUKUMA_RE.test(text)) continue;
 
       const elR = el.getBoundingClientRect();
       const pseudoR = pseudo === '::before'
@@ -1095,6 +1225,9 @@ function mkPseudoBody(text, rc, rawSt) {
 
 function eraseChar(tn, offset, cpLen) {
   try {
+    // ラストライン防御: どのパスから呼ばれてもこすくまは絶対に消さない
+    if (isProtectedChar(tn, offset)) return null;
+
     const text = tn.textContent;
     const before = text.slice(0, offset);
     const ch = text.slice(offset, offset + cpLen);
@@ -1146,7 +1279,7 @@ function mkCharBody(span, rc, parentEl) {
 
 /* ---- 要素にこすくま保護テキストが含まれるか判定 ---- */
 function containsProtectedText(el) {
-  const text = el.textContent;
+  const text = el.textContent || el.value || '';
   if (!text) return false;
   return KOSUKUMA_RE.test(text);
 }
@@ -1184,6 +1317,7 @@ function tileImg(img) {
   const r = img.getBoundingClientRect();
   const src = img.src || img.currentSrc;
   if (!src || r.width < 2 || r.height < 2) return [];
+  if (containsProtectedText(img)) return [];
   img.setAttribute('data-bh', '1');
 
   let tw = TILE_PX, th = TILE_PX;
@@ -1228,6 +1362,7 @@ function tileVideo(video) {
   const r = video.getBoundingClientRect();
   if (r.width < 2 || r.height < 2) return [];
   if (video.getAttribute('data-bh') === '1') return [];
+  if (containsProtectedText(video)) return [];
   video.setAttribute('data-bh', '1');
 
   // 現在のフレームをcanvasにキャプチャ
@@ -1291,6 +1426,7 @@ function tileCanvas(canvas) {
   const r = canvas.getBoundingClientRect();
   if (r.width < 2 || r.height < 2) return [];
   if (canvas.getAttribute('data-bh') === '1') return [];
+  if (containsProtectedText(canvas)) return [];
   canvas.setAttribute('data-bh', '1');
 
   let dataUrl;
@@ -1356,6 +1492,7 @@ function tileSVG(svg) {
   const r = svg.getBoundingClientRect();
   if (r.width < 2 || r.height < 2) return [];
   if (svg.getAttribute('data-bh') === '1') return [];
+  if (containsProtectedText(svg)) return [];
   svg.setAttribute('data-bh', '1');
 
   let dataUrl;
@@ -1386,6 +1523,7 @@ function tileIframe(iframe) {
   const r = iframe.getBoundingClientRect();
   if (r.width < 2 || r.height < 2) return [];
   if (iframe.getAttribute('data-bh') === '1') return [];
+  if (containsProtectedText(iframe)) return [];
 
   // 同一オリジンチェック
   try {
@@ -1408,6 +1546,7 @@ function tileIframe(iframe) {
 /* ---- CSS背景画像のタイル分解 ---- */
 function tileBgImage(el, r, bgImg) {
   if (el.getAttribute('data-bh') === '1') return [];
+  if (containsProtectedText(el)) return [];
   el.setAttribute('data-bh', '1');
   el.style.visibility = 'hidden';
   el.style.pointerEvents = 'none';
@@ -1454,6 +1593,15 @@ function tileBgImage(el, r, bgImg) {
 /* ---- Shadow DOM再帰走査 ---- */
 function peelShadow(root) {
   if (!root) return;
+  // Shadow DOM内にもerased-styleを注入（CSSはshadow境界を超えない）
+  if (!root.querySelector('#bh-erased-style-shadow')) {
+    try {
+      const st = document.createElement('style');
+      st.id = 'bh-erased-style-shadow';
+      st.textContent = '[data-bh-erased][data-bh-erased]{color:transparent!important;-webkit-text-fill-color:transparent!important}';
+      root.appendChild(st);
+    } catch {}
+  }
   // Shadow DOM内のテキストノードを走査
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
   let node;
@@ -1538,6 +1686,7 @@ function _tileWithSrc(r, src) {
 }
 
 function _tileFallback(el, r, color) {
+  if (containsProtectedText(el)) return [];
   el.setAttribute('data-bh', '1');
   el.style.visibility = 'hidden';
   el.style.pointerEvents = 'none';
@@ -1575,6 +1724,8 @@ function _tileFallback(el, r, color) {
 /* ================================================================
    物理
    ================================================================ */
+const _removeQueue = [];
+
 function physicsAndAbsorb(dt) {
   const field = sz * BH_FIELD;
   const fieldSq = field * field * 1.5;
@@ -1584,6 +1735,7 @@ function physicsAndAbsorb(dt) {
   let write = 0;
   let absorbCount = 0;
   const MAX_ABSORB_PER_FRAME = sz > 200 ? 50 : 30;
+  _removeQueue.length = 0;
 
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i];
@@ -1593,14 +1745,14 @@ function physicsAndAbsorb(dt) {
 
     // 吸収判定（distSq再利用でsqrt不要）
     if (distSq < coreSq && absorbCount < MAX_ABSORB_PER_FRAME) {
-      b.el.remove();
+      _removeQueue.push(b.el);
       absorbCount++;
       continue;
     }
 
     // 画面外 + 重力圏外のボディをカリング
     if (distSq > fieldSq && (b.x < -200 || b.x > vw + 200 || b.y < -200 || b.y > vh + 200)) {
-      b.el.remove();
+      _removeQueue.push(b.el);
       continue;
     }
 
@@ -1612,8 +1764,9 @@ function physicsAndAbsorb(dt) {
       const ty = (b.y - b.oy) | 0;
       if (tx !== b._ptx || ty !== b._pty) {
         b._ptx = tx; b._pty = ty;
-        b.el.style.transform = 'translate(' + tx + 'px,' + ty + 'px)rotate(' + (b.rot | 0) + 'deg)';
-        b.el.style.opacity = 1;
+        const s = b.el.style;
+        s.transform = 'translate(' + tx + 'px,' + ty + 'px)rotate(' + (b.rot | 0) + 'deg)';
+        s.opacity = 1;
       }
       bodies[write++] = b;
       continue;
@@ -1637,7 +1790,7 @@ function physicsAndAbsorb(dt) {
     let spd;
     if (spdSq > MAX_SPEED_SQ) {
       spd = Math.sqrt(spdSq);
-      const s = MAX_SPEED / spd; b.vx *= s; b.vy *= s;
+      const sc = MAX_SPEED / spd; b.vx *= sc; b.vy *= sc;
       spd = MAX_SPEED;
     } else {
       spd = Math.sqrt(spdSq);
@@ -1656,19 +1809,24 @@ function physicsAndAbsorb(dt) {
     const tx = (b.x - b.ox) | 0;
     const ty = (b.y - b.oy) | 0;
     const rot = b.rot | 0;
-    const sc = (scale * 1000 + 0.5) | 0;
+    const scI = (scale * 100 + 0.5) | 0;
     const op = opacity < 0.99 ? ((opacity * 100 + 0.5) | 0) : 100;
 
-    if (tx === b._ptx && ty === b._pty && rot === b._prot && sc === b._psc && op === b._pop) {
+    if (tx === b._ptx && ty === b._pty && rot === b._prot && scI === b._psc && op === b._pop) {
       bodies[write++] = b;
       continue;
     }
-    b._ptx = tx; b._pty = ty; b._prot = rot; b._psc = sc; b._pop = op;
-    b.el.style.transform = 'translate(' + tx + 'px,' + ty + 'px)rotate(' + rot + 'deg)scale(' + (sc / 1000) + ')';
-    b.el.style.opacity = op / 100;
+    b._ptx = tx; b._pty = ty; b._prot = rot; b._psc = scI; b._pop = op;
+    const s = b.el.style;
+    s.transform = 'translate(' + tx + 'px,' + ty + 'px)rotate(' + rot + 'deg)scale(' + (scI / 100) + ')';
+    s.opacity = op / 100;
     bodies[write++] = b;
   }
   bodies.length = write;
+
+  // バッチDOM除去（ループ外で1回 — レイアウトスラッシング防止）
+  for (let i = 0; i < _removeQueue.length; i++) _removeQueue[i].remove();
+  _removeQueue.length = 0;
 
   // バッチ適用（ループ外で1回だけ）
   growBatch(absorbCount);
