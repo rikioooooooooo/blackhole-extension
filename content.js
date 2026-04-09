@@ -55,6 +55,7 @@ let szDirty = false;
 let lastPosMx = -1, lastPosMy = -1;
 let frameCount = 0;
 
+
 /* ==== MutationObserver フレーム抑制 ==== */
 let _suppressMutationHandler = false;
 
@@ -738,11 +739,17 @@ function loop(ts) {
 function peel() {
   if (bodies.length >= MAX_BODIES) return;
 
+  const touchR = sz / 2 * 1.15 + 1;
+  const vw = window.innerWidth, vh = window.innerHeight;
+
+  // 移動距離を先に計算 — 高速移動時はスキャン戦略を切り替える
+  const moveDist = Math.hypot(mx - prevMx, my - prevMy);
+  // fastMoving: 経路スキャンポイントを先に配置（caretの精度向上）
+  const fastMoving = moveDist > touchR * 0.5;
+
   const baseRate = Math.min(28, 4 + Math.floor(sz / 15));
   const pressure = bodies.length / MAX_BODIES;
   const rate = pressure > 0.7 ? Math.max(3, Math.floor(baseRate * (1 - pressure))) : baseRate;
-  const touchR = sz / 2 * 1.15 + 1;
-  const vw = window.innerWidth, vh = window.innerHeight;
 
   const nAngles = Math.min(32, 6 + Math.floor(sz / 10));
   const nRings  = Math.min(7, 2 + Math.floor(sz / 40));
@@ -760,18 +767,36 @@ function peel() {
     _ptsFlat[_ptsLen++] = y;
   }
 
+  /* ---- Trail-Priority Scan: 高速移動時、経路を最優先スキャン ----
+     BHが前フレームから通過した経路は二度とスキャンされない。
+     現在位置のリングは次フレームでも再スキャン可能。
+     よって高速移動時は経路ポイントを最初に配置し、
+     budgetを経路消化に優先配分する。 */
+  if (fastMoving) {
+    const steps = Math.min(20, Math.ceil(moveDist / (touchR * 0.25)));
+    const trailAngles = Math.min(12, 6 + Math.floor(sz / 25));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      const ix = prevMx + (mx - prevMx) * t;
+      const iy = prevMy + (my - prevMy) * t;
+      pushPt(ix, iy);
+      for (let a = 0; a < trailAngles; a++) {
+        const ang = ((samplePhase * 0.37 + a) / trailAngles) * Math.PI * 2;
+        pushPt(ix + Math.cos(ang) * touchR * 0.45, iy + Math.sin(ang) * touchR * 0.45);
+        pushPt(ix + Math.cos(ang) * touchR * 0.85, iy + Math.sin(ang) * touchR * 0.85);
+      }
+    }
+  }
+
   // 大型BH: 外側リングを先に（budgetを新領域に優先配分）
   // 小型BH: 中心を先に（従来通り）
   const edgeFirst = sz > 60;
 
-  // Interleaved angle scanning: half per frame
-  // 大型BH: innerFracを下げて内部全域をカバー（旧: 0.65@sz400 → 死角85%）
+  // 大型BH: innerFracを下げて内部全域をカバー
   const innerFrac = sz > 150 ? 0.15 : sz > 60 ? 0.35 - (sz - 60) * 0.0022 : 0.35;
   if (edgeFirst) {
-    // 外側リングから内側、全角度を毎フレーム走査（インターリーブ廃止）
-    // + 最外周98%リングを追加して境界のテキスト残りを排除
     const edgeAngles = Math.min(nAngles, 16);
-    const edgeOff = samplePhase * 0.618;  // 黄金角オフセットでフレーム間カバレッジ向上
+    const edgeOff = samplePhase * 0.618;
     for (let i = 0; i < edgeAngles; i++) {
       const ang = ((edgeOff + i) / edgeAngles) * Math.PI * 2;
       pushPt(mx + Math.cos(ang) * touchR * 0.98, my + Math.sin(ang) * touchR * 0.98);
@@ -785,28 +810,10 @@ function peel() {
     }
   }
 
-  // 中心点（小型BHでは最初、大型BHでは後）
+  // 中心点
   pushPt(mx, my);
 
-  // High speed interpolation
-  const moveDist = Math.hypot(mx - prevMx, my - prevMy);
-  if (moveDist > touchR * 0.5) {
-    const steps = Math.min(8, Math.ceil(moveDist / (touchR * 0.5)));
-    for (let s = 1; s < steps; s++) {
-      const t = s / steps;
-      const ix = prevMx + (mx - prevMx) * t;
-      const iy = prevMy + (my - prevMy) * t;
-      pushPt(ix, iy);
-      for (let a = 0; a < 8; a++) {
-        const ang = (a / 8) * Math.PI * 2;
-        pushPt(ix + Math.cos(ang) * touchR * 0.5, iy + Math.sin(ang) * touchR * 0.5);
-        pushPt(ix + Math.cos(ang) * touchR * 0.9, iy + Math.sin(ang) * touchR * 0.9);
-      }
-    }
-  }
-
   if (!edgeFirst) {
-    // 小型BH: 従来通り内側から外側へ（全角度毎フレーム）
     for (let i = 0; i < nAngles; i++) {
       const ang = ((samplePhase * 0.618 + i) / nAngles) * Math.PI * 2;
       for (let r = 1; r <= nRings; r++) {
@@ -1123,6 +1130,7 @@ function peel() {
         break;
     }
   }
+
 }
 
 /* ---- リストマーカー・疑似要素のパーティクル化 ---- */
